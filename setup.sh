@@ -501,8 +501,6 @@ EOF
 }
 
 install_npctl_command() {
-  log "7.1 安装 npctl 命令"
-
   if [ ! -f "$NPCTL_SOURCE_SCRIPT" ]; then
     warn "未找到 npctl 源脚本 [$NPCTL_SOURCE_SCRIPT]。"
     return 1
@@ -539,10 +537,18 @@ setup_nginx_certbot() {
   write_nginx_acme_config || return 1
   write_nginx_snippets || return 1
   write_letsencrypt_tls_files || return 1
+  log "7.1 安装 npctl 命令"
   install_npctl_command || return 1
 
   nginx -t || return 1
   systemctl reload nginx || return 1
+}
+
+install_npctl_only() {
+  log "8. 仅安装 Nginx 反代管理脚本"
+  echo "提示：此操作只安装 /usr/local/bin/npctl，不会安装或配置 Nginx / Certbot。"
+  install_npctl_command || return 1
+  echo "已安装 npctl。使用前请先确保系统已有 Nginx / Certbot 及相关目录配置。"
 }
 
 show_menu() {
@@ -556,6 +562,7 @@ show_menu() {
  5. 安装、配置并验证 Docker
  6. 管理 Swap
  7. 安装并配置 Nginx / Certbot
+ 8. 仅安装 Nginx 反代管理脚本
  0. 按顺序执行全部
  q. 退出
 ====================================================
@@ -574,6 +581,7 @@ run_task() {
     5) setup_docker ;;
     6) setup_swap ;;
     7) setup_nginx_certbot ;;
+    8) install_npctl_only ;;
     *)
       warn "无效选项 [$choice]"
       return 1
