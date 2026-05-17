@@ -3,7 +3,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_PACKAGES=(vim curl)
+DOT_DNS="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 8.8.8.8#dns.google 8.8.4.4#dns.google 9.9.9.9#dns.quad9.net"
+BASE_PACKAGES=(vim curl bubblewrap)
 SECURITY_PACKAGES=(ufw fail2ban)
 NGINX_PACKAGES=(nginx certbot)
 NPCTL_SOURCE_SCRIPT="${SCRIPT_DIR}/nginx_proxy_control.sh"
@@ -51,13 +52,128 @@ install_packages() {
   apt install -y "${packages[@]}" || return 1
 }
 
+setup_dot_dns() {
+  local dns_ok=0
+  local resolved_ok=0
+  local backup_path
+
+  log "1. 设置 DNS-over-TLS"
+  require_command "systemctl" "当前系统不支持 systemd。" || return 1
+
+  echo "检查当前 DNS..."
+  if getent hosts deb.debian.org >/dev/null 2>&1; then
+    dns_ok=1
+    echo "当前 DNS 可用。"
+  else
+    warn "当前 DNS 不可用，将避免执行 apt。"
+  fi
+
+  echo "检查 systemd-resolved..."
+  if systemctl cat systemd-resolved >/dev/null 2>&1 && command_exists "resolvectl"; then
+    resolved_ok=1
+    echo "systemd-resolved 与 resolvectl 已可用。"
+  else
+    warn "systemd-resolved 或 resolvectl 不可用。"
+  fi
+
+  if [ "$dns_ok" -eq 1 ]; then
+    echo "安装/更新 DoT 相关依赖..."
+    install_packages ca-certificates || warn "安装 ca-certificates 失败，继续尝试 DoT 配置。"
+    apt install -y dnsutils || warn "安装 dnsutils 失败，将跳过 dig 验证。"
+
+    if [ "$resolved_ok" -eq 0 ]; then
+      echo "尝试安装 systemd-resolved..."
+      if apt-cache show systemd-resolved >/dev/null 2>&1; then
+        apt install -y systemd-resolved || return 1
+      else
+        warn "软件源中没有 systemd-resolved 包。"
+        warn "在某些 Debian 版本中，它可能包含在 systemd 包中。"
+      fi
+    fi
+  else
+    echo "跳过 apt，因为当前 DNS 不可用。"
+  fi
+
+  echo "重新检查 systemd-resolved..."
+  if ! systemctl cat systemd-resolved >/dev/null 2>&1; then
+    warn "systemd-resolved.service 不存在。"
+    warn "DNS 不可用且 systemd-resolved 不可用，无法安全继续。"
+    return 1
+  fi
+
+  if ! command_exists "resolvectl"; then
+    warn "systemd-resolved 存在，但 resolvectl 不存在。请检查 systemd 安装。"
+    return 1
+  fi
+
+  echo "备份 /etc/resolv.conf..."
+  if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+    backup_path="/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a /etc/resolv.conf "$backup_path" || warn "备份 /etc/resolv.conf 失败，继续配置。"
+
+    if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+      echo "已备份到 $backup_path"
+    fi
+  fi
+
+  echo "写入 DNS-over-TLS 配置..."
+  mkdir -p /etc/systemd/resolved.conf.d || return 1
+
+  cat > /etc/systemd/resolved.conf.d/dot.conf <<EOF
+[Resolve]
+DNS=$DOT_DNS
+FallbackDNS=
+DNSOverTLS=yes
+DNSSEC=no
+Cache=yes
+Domains=~.
+EOF
+
+  echo "启用并重启 systemd-resolved..."
+  systemctl enable --now systemd-resolved || return 1
+  systemctl restart systemd-resolved || return 1
+
+  echo "将 /etc/resolv.conf 指向 systemd-resolved stub..."
+  rm -f /etc/resolv.conf || return 1
+  ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || return 1
+
+  echo "测试 DNS..."
+  sleep 2
+  resolvectl flush-caches || true
+
+  echo
+  echo "===== resolvectl status ====="
+  resolvectl status || true
+
+  echo
+  echo "===== Test google.com ====="
+  resolvectl query google.com || true
+
+  echo
+  echo "===== Test deb.debian.org ====="
+  resolvectl query deb.debian.org || true
+  getent hosts deb.debian.org || true
+
+  echo
+  echo "===== Optional dig test ====="
+  if command_exists "dig"; then
+    dig google.com A +short || true
+  else
+    echo "dig 未安装，已跳过。"
+  fi
+}
+
 install_base_tools() {
-  log "1. 更新软件源并安装基础工具 (${BASE_PACKAGES[*]})"
+  log "2. 更新软件源并安装基础工具 (${BASE_PACKAGES[*]})"
   install_packages "${BASE_PACKAGES[@]}" || return 1
+
+  echo "验证 bubblewrap..."
+  which bwrap || return 1
+  bwrap --version || return 1
 }
 
 setup_security() {
-  log "2. 安装并配置 UFW / Fail2Ban"
+  log "3. 安装并配置 UFW / Fail2Ban"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
   install_packages "${SECURITY_PACKAGES[@]}" || return 1
 
@@ -85,7 +201,7 @@ EOF
 }
 
 set_timezone() {
-  log "3. 设置时区为 Asia/Shanghai"
+  log "4. 设置时区为 Asia/Shanghai"
   require_command "timedatectl" "当前系统不支持 timedatectl。" || return 1
 
   timedatectl set-timezone Asia/Shanghai || return 1
@@ -95,8 +211,8 @@ set_timezone() {
 install_docker() {
   local docker_script
 
-  log "5.1 安装 Docker (官方脚本)"
-  require_command "curl" "请先执行 [1. 安装基础工具]。" || return 1
+  log "6.1 安装 Docker (官方脚本)"
+  require_command "curl" "请先执行 [2. 安装基础工具]。" || return 1
 
   docker_script="$(mktemp /tmp/get-docker.XXXXXX.sh)"
   curl -fsSL https://get.docker.com -o "$docker_script" || return 1
@@ -105,9 +221,9 @@ install_docker() {
 }
 
 configure_docker_logging() {
-  log "5.2 配置 Docker 日志 (json-file, 10m)"
+  log "6.2 配置 Docker 日志 (json-file, 10m)"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
-  require_command "docker" "请先执行 [5. 安装并配置 Docker]。" || return 1
+  require_command "docker" "请先执行 [6. 安装并配置 Docker]。" || return 1
 
   mkdir -p /etc/docker || return 1
 
@@ -179,7 +295,7 @@ choose_new_username() {
 create_sudo_user() {
   local new_user
 
-  log "4. 创建新用户并加入 sudo 组"
+  log "5. 创建新用户并加入 sudo 组"
   require_command "adduser" "当前系统缺少 adduser。" || return 1
   require_command "passwd" "当前系统缺少 passwd。" || return 1
   require_command "usermod" "当前系统缺少 usermod。" || return 1
@@ -202,10 +318,10 @@ create_sudo_user() {
 configure_docker_user() {
   local target_user
 
-  log "5.3 配置 Docker 用户权限"
+  log "6.3 配置 Docker 用户权限"
 
   if ! getent group docker >/dev/null 2>&1; then
-    warn "未检测到 docker 组。请先执行 [5. 安装并配置 Docker]。"
+    warn "未检测到 docker 组。请先执行 [6. 安装并配置 Docker]。"
     return 1
   fi
 
@@ -215,8 +331,8 @@ configure_docker_user() {
 }
 
 verify_docker() {
-  log "5.4 验证 Docker 版本"
-  require_command "docker" "请先执行 [5. 安装并配置 Docker]。" || return 1
+  log "6.4 验证 Docker 版本"
+  require_command "docker" "请先执行 [6. 安装并配置 Docker]。" || return 1
 
   docker --version || return 1
 
@@ -228,7 +344,7 @@ verify_docker() {
 }
 
 setup_docker() {
-  log "5. 安装并配置 Docker"
+  log "6. 安装并配置 Docker"
   install_docker || return 1
   configure_docker_logging || return 1
   configure_docker_user || return 1
@@ -315,7 +431,7 @@ EOF
 setup_swap() {
   local selection
 
-  log "6. 管理 Swap"
+  log "7. 管理 Swap"
   check_swap_platform || return 1
 
   while true; do
@@ -512,7 +628,7 @@ install_npctl_command() {
 }
 
 setup_nginx_certbot() {
-  log "7. 安装并配置 Nginx / Certbot"
+  log "8. 安装并配置 Nginx / Certbot"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
 
   install_packages "${NGINX_PACKAGES[@]}" || return 1
@@ -537,7 +653,7 @@ setup_nginx_certbot() {
   write_nginx_acme_config || return 1
   write_nginx_snippets || return 1
   write_letsencrypt_tls_files || return 1
-  log "7.1 安装 npctl 命令"
+  log "8.1 安装 npctl 命令"
   install_npctl_command || return 1
 
   nginx -t || return 1
@@ -545,7 +661,7 @@ setup_nginx_certbot() {
 }
 
 install_npctl_only() {
-  log "8. 仅安装 Nginx 反代管理脚本"
+  log "9. 仅安装 Nginx 反代管理脚本"
   echo "提示：此操作只安装 /usr/local/bin/npctl，不会安装或配置 Nginx / Certbot。"
   install_npctl_command || return 1
   echo "已安装 npctl。使用前请先确保系统已有 Nginx / Certbot 及相关目录配置。"
@@ -555,14 +671,15 @@ show_menu() {
   cat <<'EOF'
 
 ================ 服务器初始化交互菜单 ================
- 1. 更新软件源并安装基础工具
- 2. 安装并配置 UFW / Fail2Ban
- 3. 设置时区为 Asia/Shanghai
- 4. 创建新用户并加入 sudo 组
- 5. 安装、配置并验证 Docker
- 6. 管理 Swap
- 7. 安装并配置 Nginx / Certbot
- 8. 仅安装 Nginx 反代管理脚本
+ 1. 设置 DNS-over-TLS
+ 2. 更新软件源并安装基础工具
+ 3. 安装并配置 UFW / Fail2Ban
+ 4. 设置时区为 Asia/Shanghai
+ 5. 创建新用户并加入 sudo 组
+ 6. 安装、配置并验证 Docker
+ 7. 管理 Swap
+ 8. 安装并配置 Nginx / Certbot
+ 9. 仅安装 Nginx 反代管理脚本
  0. 按顺序执行全部
  q. 退出
 ====================================================
@@ -574,14 +691,15 @@ run_task() {
   local choice="$1"
 
   case "$choice" in
-    1) install_base_tools ;;
-    2) setup_security ;;
-    3) set_timezone ;;
-    4) create_sudo_user ;;
-    5) setup_docker ;;
-    6) setup_swap ;;
-    7) setup_nginx_certbot ;;
-    8) install_npctl_only ;;
+    1) setup_dot_dns ;;
+    2) install_base_tools ;;
+    3) setup_security ;;
+    4) set_timezone ;;
+    5) create_sudo_user ;;
+    6) setup_docker ;;
+    7) setup_swap ;;
+    8) setup_nginx_certbot ;;
+    9) install_npctl_only ;;
     *)
       warn "无效选项 [$choice]"
       return 1
@@ -592,7 +710,7 @@ run_task() {
 run_all_tasks() {
   local task
 
-  for task in 1 2 3 4 5 6 7; do
+  for task in 1 2 3 4 5 6 7 8; do
     if ! run_task "$task"; then
       warn "执行步骤 [$task] 失败，已停止后续任务。"
       return 1
