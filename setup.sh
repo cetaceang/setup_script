@@ -4,6 +4,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOT_DNS="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 8.8.8.8#dns.google 8.8.4.4#dns.google 9.9.9.9#dns.quad9.net"
+PLAIN_DNS="1.1.1.1 8.8.8.8"
+PLAIN_FALLBACK_DNS="9.9.9.9"
+RESOLVED_CONFIG_DIR="/etc/systemd/resolved.conf.d"
+DOT_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dot.conf"
+PLAIN_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dns.conf"
 BASE_PACKAGES=(vim curl bubblewrap)
 SECURITY_PACKAGES=(ufw fail2ban)
 NGINX_PACKAGES=(nginx certbot)
@@ -52,12 +57,11 @@ install_packages() {
   apt install -y "${packages[@]}" || return 1
 }
 
-setup_dot_dns() {
+ensure_resolved_ready() {
+  local install_dot_dependencies="${1:-0}"
   local dns_ok=0
   local resolved_ok=0
-  local backup_path
 
-  log "1. 设置 DNS-over-TLS"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
 
   echo "检查当前 DNS..."
@@ -77,9 +81,13 @@ setup_dot_dns() {
   fi
 
   if [ "$dns_ok" -eq 1 ]; then
-    echo "安装/更新 DoT 相关依赖..."
-    install_packages ca-certificates || warn "安装 ca-certificates 失败，继续尝试 DoT 配置。"
-    apt install -y dnsutils || warn "安装 dnsutils 失败，将跳过 dig 验证。"
+    if [ "$install_dot_dependencies" -eq 1 ]; then
+      echo "安装/更新 DoT 相关依赖..."
+      install_packages ca-certificates || warn "安装 ca-certificates 失败，继续尝试 DoT 配置。"
+    fi
+
+    echo "安装/更新 DNS 验证工具..."
+    install_packages dnsutils || warn "安装 dnsutils 失败，将跳过 dig 验证。"
 
     if [ "$resolved_ok" -eq 0 ]; then
       echo "尝试安装 systemd-resolved..."
@@ -105,6 +113,10 @@ setup_dot_dns() {
     warn "systemd-resolved 存在，但 resolvectl 不存在。请检查 systemd 安装。"
     return 1
   fi
+}
+
+backup_resolv_conf() {
+  local backup_path
 
   echo "备份 /etc/resolv.conf..."
   if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
@@ -115,11 +127,13 @@ setup_dot_dns() {
       echo "已备份到 $backup_path"
     fi
   fi
+}
 
+write_dot_dns_config() {
   echo "写入 DNS-over-TLS 配置..."
-  mkdir -p /etc/systemd/resolved.conf.d || return 1
+  mkdir -p "$RESOLVED_CONFIG_DIR" || return 1
 
-  cat > /etc/systemd/resolved.conf.d/dot.conf <<EOF
+  cat > "$DOT_DNS_CONFIG" <<EOF
 [Resolve]
 DNS=$DOT_DNS
 FallbackDNS=
@@ -129,6 +143,24 @@ Cache=yes
 Domains=~.
 EOF
 
+  rm -f "$PLAIN_DNS_CONFIG" || return 1
+}
+
+write_plain_dns_config() {
+  echo "写入普通 DNS 配置..."
+  mkdir -p "$RESOLVED_CONFIG_DIR" || return 1
+
+  cat > "$PLAIN_DNS_CONFIG" <<EOF
+[Resolve]
+DNS=$PLAIN_DNS
+FallbackDNS=$PLAIN_FALLBACK_DNS
+DNSOverTLS=no
+EOF
+
+  rm -f "$DOT_DNS_CONFIG" || return 1
+}
+
+activate_resolved_dns() {
   echo "启用并重启 systemd-resolved..."
   systemctl enable --now systemd-resolved || return 1
   systemctl restart systemd-resolved || return 1
@@ -136,7 +168,9 @@ EOF
   echo "将 /etc/resolv.conf 指向 systemd-resolved stub..."
   rm -f /etc/resolv.conf || return 1
   ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || return 1
+}
 
+test_resolved_dns() {
   echo "测试 DNS..."
   sleep 2
   resolvectl flush-caches || true
@@ -161,6 +195,70 @@ EOF
   else
     echo "dig 未安装，已跳过。"
   fi
+}
+
+setup_dot_dns() {
+  log "1.1 使用 DNS-over-TLS"
+  ensure_resolved_ready 1 || return 1
+  backup_resolv_conf || return 1
+  write_dot_dns_config || return 1
+  activate_resolved_dns || return 1
+  test_resolved_dns || return 1
+}
+
+setup_plain_dns() {
+  log "1.2 使用普通 DNS"
+  ensure_resolved_ready 0 || return 1
+  backup_resolv_conf || return 1
+  write_plain_dns_config || return 1
+  activate_resolved_dns || return 1
+  test_resolved_dns || return 1
+}
+
+show_dns_menu() {
+  cat <<'EOF'
+
+================ DNS 设置菜单 ================
+ 1. 使用 DNS-over-TLS (DoT)
+ 2. 使用普通 DNS (1.1.1.1 / 8.8.8.8)
+ q. 返回上级菜单
+============================================
+每次请输入一个编号
+EOF
+}
+
+setup_dns() {
+  local selection
+
+  log "1. 更改 DNS 设置"
+
+  while true; do
+    show_dns_menu
+    read -rp "请输入要执行的编号: " selection
+
+    if [ -z "${selection}" ]; then
+      warn "未输入任何选项，请重新输入。"
+      continue
+    fi
+
+    case "$selection" in
+      1)
+        setup_dot_dns || return 1
+        return 0
+        ;;
+      2)
+        setup_plain_dns || return 1
+        return 0
+        ;;
+      q|Q)
+        echo "已返回上级菜单。"
+        return 0
+        ;;
+      *)
+        warn "无效选项 [$selection]"
+        ;;
+    esac
+  done
 }
 
 install_base_tools() {
@@ -671,7 +769,7 @@ show_menu() {
   cat <<'EOF'
 
 ================ 服务器初始化交互菜单 ================
- 1. 设置 DNS-over-TLS
+ 1. 更改 DNS 设置
  2. 更新软件源并安装基础工具
  3. 安装并配置 UFW / Fail2Ban
  4. 设置时区为 Asia/Shanghai
@@ -691,7 +789,7 @@ run_task() {
   local choice="$1"
 
   case "$choice" in
-    1) setup_dot_dns ;;
+    1) setup_dns ;;
     2) install_base_tools ;;
     3) setup_security ;;
     4) set_timezone ;;
