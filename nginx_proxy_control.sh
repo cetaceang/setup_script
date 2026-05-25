@@ -9,14 +9,23 @@ readonly NGINX_SITES_AVAILABLE_DIR="/etc/nginx/sites-available"
 readonly NGINX_SITES_ENABLED_DIR="/etc/nginx/sites-enabled"
 readonly LETSENCRYPT_DIR="/etc/letsencrypt"
 readonly ASSET_LOCATION_PATTERN='~* \.(?:avif|bmp|css|gif|ico|jpe?g|js|json|mjs|png|svg|txt|webp|woff2?)$'
+readonly CLOUDFLARE_CREDENTIALS_DIR="/root/.secrets/certbot"
+readonly CLOUDFLARE_CREDENTIALS_FILE="${CLOUDFLARE_CREDENTIALS_DIR}/cloudflare.ini"
 
-SITE_PRIMARY_DOMAIN=""
-declare -a SITE_DOMAINS=()
+SITE_DOMAIN=""
 UPSTREAM_IP=""
 UPSTREAM_PORT=""
 ENABLE_BLOCK_COMMON_EXPLOITS=0
 ENABLE_PROXY_CACHE_ASSETS=0
 ENABLE_BROWSER_CACHE_HEADERS=0
+SELECTED_CERT_NAME=""
+SELECTED_CERT_DOMAINS=""
+SELECTED_CERT_EXPIRY=""
+
+declare -a CERTIFICATE_NAMES=()
+declare -a CERTIFICATE_DOMAINS=()
+declare -a CERTIFICATE_EXPIRIES=()
+declare -a ENABLED_SITE_NAMES=()
 
 log() {
   echo
@@ -65,23 +74,6 @@ trim() {
   value="${value%"${value##*[![:space:]]}"}"
 
   printf '%s' "$value"
-}
-
-join_by() {
-  local separator="$1"
-  local item
-  shift
-
-  local first=1
-
-  for item in "$@"; do
-    if [ "$first" -eq 1 ]; then
-      printf '%s' "$item"
-      first=0
-    else
-      printf '%s%s' "$separator" "$item"
-    fi
-  done
 }
 
 validate_domain() {
@@ -149,11 +141,34 @@ prompt_yes_no() {
   done
 }
 
-check_environment() {
-  require_command "nginx" "请先完成 Nginx / Certbot 安装步骤。" || return 1
+check_certificate_environment() {
   require_command "certbot" "请先完成 Nginx / Certbot 安装步骤。" || return 1
-  require_command "systemctl" "当前系统不支持 systemd。" || return 1
+}
 
+check_cloudflare_plugin() {
+  local plugin_output
+
+  check_certificate_environment || return 1
+
+  plugin_output="$(certbot plugins 2>/dev/null)" || {
+    warn "执行 certbot plugins 失败，请确认 Certbot 已正确安装。"
+    return 1
+  }
+
+  if ! printf '%s\n' "$plugin_output" | grep -q "dns-cloudflare"; then
+    warn "未检测到 certbot dns-cloudflare 插件，请先重新执行安装步骤。"
+    return 1
+  fi
+}
+
+check_nginx_environment() {
+  require_command "nginx" "请先完成 Nginx 安装步骤。" || return 1
+  require_command "systemctl" "当前系统不支持 systemd。" || return 1
+  require_path "$NGINX_SITES_AVAILABLE_DIR" "请确认 Nginx 安装完整。" || return 1
+  require_path "$NGINX_SITES_ENABLED_DIR" "请确认 Nginx 安装完整。" || return 1
+}
+
+check_site_template_environment() {
   require_path "$ACME_WEBROOT" "请先完成 Nginx / Certbot 安装步骤。" || return 1
   require_path "$NGINX_SNIPPETS_DIR/acme-webroot.conf" "请先完成 Nginx / Certbot 安装步骤。" || return 1
   require_path "$NGINX_SNIPPETS_DIR/redirect-https-308.conf" "请先完成 Nginx / Certbot 安装步骤。" || return 1
@@ -164,65 +179,40 @@ check_environment() {
   require_path "$NGINX_SNIPPETS_DIR/cache-assets.optional.conf" "请先完成 Nginx / Certbot 安装步骤。" || return 1
   require_path "$LETSENCRYPT_DIR/options-ssl-nginx.conf" "请先完成 Nginx / Certbot 安装步骤。" || return 1
   require_path "$LETSENCRYPT_DIR/ssl-dhparams.pem" "请先完成 Nginx / Certbot 安装步骤。" || return 1
-  require_path "$NGINX_SITES_AVAILABLE_DIR" "请确认 Nginx 安装完整。" || return 1
-  require_path "$NGINX_SITES_ENABLED_DIR" "请确认 Nginx 安装完整。" || return 1
 }
 
-collect_domains() {
+reset_create_site_state() {
+  SITE_DOMAIN=""
+  UPSTREAM_IP=""
+  UPSTREAM_PORT=""
+  ENABLE_BLOCK_COMMON_EXPLOITS=0
+  ENABLE_PROXY_CACHE_ASSETS=0
+  ENABLE_BROWSER_CACHE_HEADERS=0
+  SELECTED_CERT_NAME=""
+  SELECTED_CERT_DOMAINS=""
+  SELECTED_CERT_EXPIRY=""
+}
+
+collect_site_domain() {
   local input
-  local domain
-  local -a parsed_domains=()
-  declare -A seen_domains=()
 
   while true; do
-    parsed_domains=()
-    seen_domains=()
-
-    read -rp "请输入域名（多个域名用空格分隔，第一个作为主域名）: " input
+    read -rp "请输入站点域名: " input
     input="$(trim "$input")"
+    input="${input,,}"
 
     if [ -z "$input" ]; then
       warn "域名不能为空。"
       continue
     fi
 
-    read -r -a parsed_domains <<< "$input"
-
-    if [ "${#parsed_domains[@]}" -eq 0 ]; then
-      warn "请至少输入一个域名。"
+    if ! validate_domain "$input"; then
+      warn "域名 [$input] 格式无效。当前站点配置只支持单个普通域名。"
       continue
     fi
 
-    local is_valid=1
-
-    for domain in "${parsed_domains[@]}"; do
-      domain="${domain,,}"
-
-      if ! validate_domain "$domain"; then
-        warn "域名 [$domain] 格式无效。当前脚本不支持通配符证书。"
-        is_valid=0
-        break
-      fi
-
-      if [ -n "${seen_domains[$domain]:-}" ]; then
-        warn "域名 [$domain] 重复，请重新输入。"
-        is_valid=0
-        break
-      fi
-
-      seen_domains["$domain"]=1
-    done
-
-    if [ "$is_valid" -eq 1 ]; then
-      SITE_DOMAINS=()
-
-      for domain in "${parsed_domains[@]}"; do
-        SITE_DOMAINS+=("${domain,,}")
-      done
-
-      SITE_PRIMARY_DOMAIN="${SITE_DOMAINS[0]}"
-      return 0
-    fi
+    SITE_DOMAIN="$input"
+    return 0
   done
 }
 
@@ -277,25 +267,362 @@ collect_optional_snippets() {
   fi
 }
 
-show_summary() {
-  local domains_text
+append_certificate_record() {
+  local cert_name="$1"
+  local cert_domains="$2"
+  local cert_expiry="$3"
 
-  domains_text="$(join_by ' ' "${SITE_DOMAINS[@]}")"
+  if [ -z "$cert_name" ]; then
+    return 0
+  fi
 
+  CERTIFICATE_NAMES+=("$cert_name")
+  CERTIFICATE_DOMAINS+=("$cert_domains")
+  CERTIFICATE_EXPIRIES+=("$cert_expiry")
+}
+
+load_certificates() {
+  local certbot_output
+  local line
+  local current_name=""
+  local current_domains=""
+  local current_expiry=""
+
+  CERTIFICATE_NAMES=()
+  CERTIFICATE_DOMAINS=()
+  CERTIFICATE_EXPIRIES=()
+
+  certbot_output="$(certbot certificates 2>&1)" || {
+    warn "执行 certbot certificates 失败。"
+    printf '%s\n' "$certbot_output" >&2
+    return 1
+  }
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*Certificate[[:space:]]Name:[[:space:]]+(.+)$ ]]; then
+      append_certificate_record "$current_name" "$current_domains" "$current_expiry"
+      current_name="$(trim "${BASH_REMATCH[1]}")"
+      current_domains=""
+      current_expiry=""
+      continue
+    fi
+
+    if [[ "$line" =~ ^[[:space:]]*Domains:[[:space:]]+(.+)$ ]]; then
+      current_domains="$(trim "${BASH_REMATCH[1]}")"
+      continue
+    fi
+
+    if [[ "$line" =~ ^[[:space:]]*Expiry[[:space:]]Date:[[:space:]]+(.+)$ ]]; then
+      current_expiry="$(trim "${BASH_REMATCH[1]}")"
+      continue
+    fi
+  done <<< "$certbot_output"
+
+  append_certificate_record "$current_name" "$current_domains" "$current_expiry"
+}
+
+show_certificates_list() {
+  local idx
+
+  if [ "${#CERTIFICATE_NAMES[@]}" -eq 0 ]; then
+    echo "当前没有可用证书。"
+    return 0
+  fi
+
+  for idx in "${!CERTIFICATE_NAMES[@]}"; do
+    echo " $((idx + 1)). ${CERTIFICATE_NAMES[$idx]}"
+    echo "    覆盖域名: ${CERTIFICATE_DOMAINS[$idx]:-(未解析)}"
+
+    if [ -n "${CERTIFICATE_EXPIRIES[$idx]}" ]; then
+      echo "    到期: ${CERTIFICATE_EXPIRIES[$idx]}"
+    fi
+  done
+}
+
+list_certificates_action() {
+  check_certificate_environment || return 1
+  load_certificates || return 1
+
+  log "本机已有证书"
+  show_certificates_list
+}
+
+write_cloudflare_credentials() {
+  local api_token="$1"
+
+  mkdir -p /root/.secrets || return 1
+  chmod 0700 /root/.secrets || return 1
+  mkdir -p "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
+  chmod 0700 "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
+
+  (
+    umask 077
+    cat > "$CLOUDFLARE_CREDENTIALS_FILE" <<EOF
+dns_cloudflare_api_token = ${api_token}
+EOF
+  ) || return 1
+
+  chmod 0600 "$CLOUDFLARE_CREDENTIALS_FILE" || return 1
+}
+
+ensure_cloudflare_credentials() {
+  local api_token
+
+  mkdir -p /root/.secrets || return 1
+  chmod 0700 /root/.secrets || return 1
+  mkdir -p "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
+  chmod 0700 "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
+
+  if [ -s "$CLOUDFLARE_CREDENTIALS_FILE" ]; then
+    echo "已检测到 Cloudflare 凭据文件: $CLOUDFLARE_CREDENTIALS_FILE"
+
+    if prompt_yes_no "是否复用现有 Cloudflare API Token" "y"; then
+      chmod 0600 "$CLOUDFLARE_CREDENTIALS_FILE" || return 1
+      return 0
+    fi
+  fi
+
+  while true; do
+    read -rsp "请输入 Cloudflare API Token: " api_token
+    echo
+    api_token="$(trim "$api_token")"
+
+    if [ -z "$api_token" ]; then
+      warn "API Token 不能为空。"
+      continue
+    fi
+
+    write_cloudflare_credentials "$api_token" || return 1
+    echo "已写入 Cloudflare 凭据文件。"
+    return 0
+  done
+}
+
+collect_wildcard_apex_domain() {
+  local input
+
+  while true; do
+    read -rp "请输入要申请通配证书的裸域（例如 example.com）: " input
+    input="$(trim "$input")"
+    input="${input,,}"
+
+    if [ -z "$input" ]; then
+      warn "域名不能为空。"
+      continue
+    fi
+
+    if ! validate_domain "$input"; then
+      warn "域名 [$input] 格式无效，请输入裸域，例如 example.com。"
+      continue
+    fi
+
+    printf '%s' "$input"
+    return 0
+  done
+}
+
+run_certbot_renew_dry_run() {
+  log "执行 Certbot 续期演练"
+
+  if ! certbot renew --dry-run; then
+    warn "续期演练失败，请稍后手动检查 certbot renew --dry-run。"
+  fi
+}
+
+collect_webroot_certificate_domain() {
+  local input
+
+  while true; do
+    read -rp "请输入要申请 Webroot 证书的域名: " input
+    input="$(trim "$input")"
+    input="${input,,}"
+
+    if [ -z "$input" ]; then
+      warn "域名不能为空。"
+      continue
+    fi
+
+    if ! validate_domain "$input"; then
+      warn "域名 [$input] 格式无效，请输入普通域名，例如 api.example.com。"
+      continue
+    fi
+
+    printf '%s' "$input"
+    return 0
+  done
+}
+
+issue_webroot_certificate() {
+  local cert_domain="$1"
+  local -a certbot_args=()
+
+  check_certificate_environment || return 1
+  check_nginx_environment || return 1
+  check_site_template_environment || return 1
+
+  log "即将申请 Webroot 证书"
+  echo "cert-name: ${cert_domain}"
+  echo "覆盖域名: ${cert_domain}"
+  echo "Webroot 目录: ${ACME_WEBROOT}"
+
+  if ! prompt_yes_no "确认申请该 Webroot 证书" "y"; then
+    echo "已取消。"
+    return 2
+  fi
+
+  certbot_args=(
+    certbot certonly
+    --webroot
+    -w "$ACME_WEBROOT"
+    --cert-name "$cert_domain"
+    -d "$cert_domain"
+  )
+
+  log "申请 Webroot 证书"
+  "${certbot_args[@]}" || return 1
+
+  run_certbot_renew_dry_run
+
+  log "证书申请完成"
+  echo "cert-name: ${cert_domain}"
+  echo "覆盖域名: ${cert_domain}"
+}
+
+issue_webroot_certificate_interactive() {
+  local cert_domain
+  local result
+
+  cert_domain="$(collect_webroot_certificate_domain)" || return 1
+  issue_webroot_certificate "$cert_domain"
+  result=$?
+
+  case "$result" in
+    0|2) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+issue_cloudflare_wildcard_certificate() {
+  local apex_domain
+  local -a certbot_args=()
+
+  check_cloudflare_plugin || return 1
+
+  apex_domain="$(collect_wildcard_apex_domain)" || return 1
+  ensure_cloudflare_credentials || return 1
+
+  log "即将申请 Cloudflare 通配证书"
+  echo "cert-name: ${apex_domain}"
+  echo "覆盖域名: ${apex_domain} *.${apex_domain}"
+  echo "凭据文件: ${CLOUDFLARE_CREDENTIALS_FILE}"
+
+  if ! prompt_yes_no "确认申请该通配证书" "y"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  certbot_args=(
+    certbot certonly
+    --dns-cloudflare
+    --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS_FILE"
+    --cert-name "$apex_domain"
+    -d "$apex_domain"
+    -d "*.$apex_domain"
+  )
+
+  log "申请 Cloudflare 通配证书"
+  "${certbot_args[@]}" || return 1
+
+  run_certbot_renew_dry_run
+
+  log "证书申请完成"
+  echo "cert-name: ${apex_domain}"
+  echo "覆盖域名: ${apex_domain} *.${apex_domain}"
+}
+
+select_certificate() {
+  local selection
+  local index
+  local issue_result
+
+  while true; do
+    load_certificates || return 1
+
+    log "请选择要绑定的证书"
+    show_certificates_list
+
+    if [ "${#CERTIFICATE_NAMES[@]}" -eq 0 ]; then
+      echo " n. 为当前站点申请新的 Webroot 证书"
+      echo " w. 申请新的 Cloudflare 通配证书"
+      echo " q. 取消"
+    else
+      echo " n. 为当前站点申请新的 Webroot 证书"
+      echo " w. 申请新的 Cloudflare 通配证书"
+      echo " r. 刷新证书列表"
+      echo " q. 取消"
+    fi
+
+    read -rp "请选择要绑定的证书编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      n|N)
+        issue_webroot_certificate "$SITE_DOMAIN"
+        issue_result=$?
+
+        case "$issue_result" in
+          0|2) continue ;;
+          *) return 1 ;;
+        esac
+        ;;
+      w|W)
+        issue_cloudflare_wildcard_certificate || return 1
+        continue
+        ;;
+      r|R)
+        if [ "${#CERTIFICATE_NAMES[@]}" -eq 0 ]; then
+          warn "当前没有可刷新的证书列表，请先申请证书。"
+        fi
+        continue
+        ;;
+      q|Q)
+        return 2
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#CERTIFICATE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      SELECTED_CERT_NAME="${CERTIFICATE_NAMES[$index]}"
+      SELECTED_CERT_DOMAINS="${CERTIFICATE_DOMAINS[$index]}"
+      SELECTED_CERT_EXPIRY="${CERTIFICATE_EXPIRIES[$index]}"
+      return 0
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+}
+
+show_create_site_summary() {
   log "即将创建以下站点"
-  echo "主域名: ${SITE_PRIMARY_DOMAIN}"
-  echo "全部域名: ${domains_text}"
+  echo "站点域名: ${SITE_DOMAIN}"
+  echo "绑定证书: ${SELECTED_CERT_NAME}"
+  echo "证书覆盖域名: ${SELECTED_CERT_DOMAINS:-未解析}"
+
+  if [ -n "$SELECTED_CERT_EXPIRY" ]; then
+    echo "证书到期: ${SELECTED_CERT_EXPIRY}"
+  fi
+
   echo "反代目标: ${UPSTREAM_IP}:${UPSTREAM_PORT}"
   echo "可选 snippets:"
   echo "  block-common-exploits.optional.conf: ${ENABLE_BLOCK_COMMON_EXPLOITS}"
   echo "  proxy-cache-assets.optional.conf: ${ENABLE_PROXY_CACHE_ASSETS}"
   echo "  cache-assets.optional.conf: ${ENABLE_BROWSER_CACHE_HEADERS}"
+  echo "提示: 当前不会校验证书是否覆盖该站点域名，请自行确认。"
 }
 
 build_site_config() {
   local site_file="$1"
   local upstream_name="$2"
-  local domains_text="$3"
 
   cat > "$site_file" <<EOF
 upstream ${upstream_name} {
@@ -305,7 +632,7 @@ upstream ${upstream_name} {
 
 server {
     listen 80;
-    server_name ${domains_text};
+    server_name ${SITE_DOMAIN};
 
     include /etc/nginx/snippets/acme-webroot.conf;
     include /etc/nginx/snippets/redirect-https-308.conf;
@@ -313,10 +640,10 @@ server {
 
 server {
     listen 443 ssl http2;
-    server_name ${domains_text};
+    server_name ${SITE_DOMAIN};
 
-    ssl_certificate     /etc/letsencrypt/live/${SITE_PRIMARY_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${SITE_PRIMARY_DOMAIN}/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/${SELECTED_CERT_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SELECTED_CERT_NAME}/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
@@ -365,43 +692,25 @@ EOF
 EOF
 }
 
-request_certificate() {
-  local certbot_args=()
-  local domain
-
-  certbot_args=(certbot certonly --webroot -w "$ACME_WEBROOT" --cert-name "$SITE_PRIMARY_DOMAIN")
-
-  for domain in "${SITE_DOMAINS[@]}"; do
-    certbot_args+=(-d "$domain")
-  done
-
-  log "申请证书"
-  "${certbot_args[@]}" || return 1
-}
-
 create_proxy_site() {
   local upstream_name
-  local domains_text
   local available_file
   local enabled_file
   local temp_file
+  local select_result
   local link_created=0
   local file_created=0
 
-  collect_domains || return 1
-  collect_upstream || return 1
-  collect_optional_snippets || return 1
-  show_summary
+  check_nginx_environment || return 1
+  check_site_template_environment || return 1
+  check_certificate_environment || return 1
+  reset_create_site_state
 
-  if ! prompt_yes_no "确认按以上配置创建站点" "y"; then
-    echo "已取消。"
-    return 0
-  fi
+  collect_site_domain || return 1
 
-  available_file="${NGINX_SITES_AVAILABLE_DIR}/${SITE_PRIMARY_DOMAIN}"
-  enabled_file="${NGINX_SITES_ENABLED_DIR}/${SITE_PRIMARY_DOMAIN}"
-  upstream_name="$(echo "${SITE_PRIMARY_DOMAIN}" | sed 's/[^A-Za-z0-9]/_/g')_upstream"
-  domains_text="$(join_by ' ' "${SITE_DOMAINS[@]}")"
+  available_file="${NGINX_SITES_AVAILABLE_DIR}/${SITE_DOMAIN}"
+  enabled_file="${NGINX_SITES_ENABLED_DIR}/${SITE_DOMAIN}"
+  upstream_name="$(echo "${SITE_DOMAIN}" | sed 's/[^A-Za-z0-9]/_/g')_upstream"
 
   if [ -e "$available_file" ] || [ -L "$available_file" ]; then
     warn "站点文件 [$available_file] 已存在，已停止。"
@@ -413,10 +722,31 @@ create_proxy_site() {
     return 1
   fi
 
-  request_certificate || return 1
+  select_certificate
+  select_result=$?
+
+  case "$select_result" in
+    0) ;;
+    2)
+      echo "已取消。"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  collect_upstream || return 1
+  collect_optional_snippets || return 1
+  show_create_site_summary
+
+  if ! prompt_yes_no "确认按以上配置创建站点" "y"; then
+    echo "已取消。"
+    return 0
+  fi
 
   temp_file="$(mktemp /tmp/npctl-site.XXXXXX.conf)" || return 1
-  build_site_config "$temp_file" "$upstream_name" "$domains_text" || {
+  build_site_config "$temp_file" "$upstream_name" || {
     rm -f "$temp_file"
     return 1
   }
@@ -436,33 +766,186 @@ create_proxy_site() {
   log "检查 Nginx 配置"
   if ! nginx -t; then
     warn "Nginx 配置校验失败，已回滚本次创建的站点文件和链接。"
+
     if [ "$link_created" -eq 1 ]; then
       rm -f "$enabled_file"
     fi
+
     if [ "$file_created" -eq 1 ]; then
       rm -f "$available_file"
     fi
+
     return 1
   fi
 
   log "重载 Nginx"
   if ! systemctl reload nginx; then
     warn "Nginx 重载失败，已回滚本次创建的站点文件和链接。"
-    rm -f "$enabled_file"
-    rm -f "$available_file"
+
+    if [ "$link_created" -eq 1 ]; then
+      rm -f "$enabled_file"
+    fi
+
+    if [ "$file_created" -eq 1 ]; then
+      rm -f "$available_file"
+    fi
+
     return 1
   fi
 
-  log "执行 Certbot 续期演练"
-  if ! certbot renew --dry-run; then
-    warn "续期演练失败，请稍后手动检查 certbot renew --dry-run。"
-  fi
+  run_certbot_renew_dry_run
 
   log "站点创建完成"
   echo "站点文件: ${available_file}"
   echo "启用链接: ${enabled_file}"
-  echo "域名: ${domains_text}"
+  echo "站点域名: ${SITE_DOMAIN}"
+  echo "绑定证书: ${SELECTED_CERT_NAME}"
   echo "反代目标: ${UPSTREAM_IP}:${UPSTREAM_PORT}"
+}
+
+extract_server_names_from_config() {
+  local site_file="$1"
+  local server_names
+
+  if [ ! -f "$site_file" ]; then
+    printf '%s' "未找到配置文件"
+    return 0
+  fi
+
+  server_names="$(awk '
+    /^[[:space:]]*server_name[[:space:]]+/ {
+      for (i = 2; i <= NF; i++) {
+        gsub(/;/, "", $i)
+
+        if ($i != "") {
+          if (names != "") {
+            names = names " "
+          }
+
+          names = names $i
+        }
+      }
+    }
+    END { print names }
+  ' "$site_file")"
+
+  server_names="$(trim "$server_names")"
+  printf '%s' "${server_names:-未解析}"
+}
+
+load_enabled_sites() {
+  local path
+
+  ENABLED_SITE_NAMES=()
+
+  shopt -s nullglob
+  for path in "$NGINX_SITES_ENABLED_DIR"/*; do
+    [ -L "$path" ] || continue
+    ENABLED_SITE_NAMES+=("$(basename "$path")")
+  done
+  shopt -u nullglob
+}
+
+show_enabled_sites() {
+  local idx
+  local site_name
+  local available_file
+
+  if [ "${#ENABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    echo "当前没有已启用站点。"
+    return 0
+  fi
+
+  for idx in "${!ENABLED_SITE_NAMES[@]}"; do
+    site_name="${ENABLED_SITE_NAMES[$idx]}"
+    available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+    echo " $((idx + 1)). ${site_name}"
+    echo "    server_name: $(extract_server_names_from_config "$available_file")"
+  done
+}
+
+disable_site() {
+  local selection
+  local index
+  local site_name
+  local enabled_file
+  local available_file
+  local server_names
+
+  check_nginx_environment || return 1
+  load_enabled_sites
+
+  log "已启用站点"
+  show_enabled_sites
+
+  if [ "${#ENABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要禁用的站点编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ENABLED_SITE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      site_name="${ENABLED_SITE_NAMES[$index]}"
+      break
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+
+  enabled_file="${NGINX_SITES_ENABLED_DIR}/${site_name}"
+  available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+  server_names="$(extract_server_names_from_config "$available_file")"
+
+  log "即将禁用以下站点"
+  echo "站点名: ${site_name}"
+  echo "配置文件: ${available_file}"
+  echo "启用链接: ${enabled_file}"
+  echo "server_name: ${server_names}"
+
+  if ! prompt_yes_no "确认禁用此站点" "n"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  rm -f "$enabled_file" || return 1
+
+  log "检查 Nginx 配置"
+  if ! nginx -t; then
+    warn "Nginx 配置校验失败，已恢复站点启用链接。"
+
+    if [ -e "$available_file" ] || [ -L "$available_file" ]; then
+      ln -s "$available_file" "$enabled_file" || warn "恢复站点链接失败，请手动检查。"
+    fi
+
+    return 1
+  fi
+
+  log "重载 Nginx"
+  if ! systemctl reload nginx; then
+    warn "Nginx 重载失败，已恢复站点启用链接。"
+
+    if [ -e "$available_file" ] || [ -L "$available_file" ]; then
+      ln -s "$available_file" "$enabled_file" || warn "恢复站点链接失败，请手动检查。"
+    fi
+
+    return 1
+  fi
+
+  log "站点已禁用"
+  echo "已移除链接: ${enabled_file}"
+  echo "保留配置: ${available_file}"
 }
 
 show_menu() {
@@ -470,6 +953,10 @@ show_menu() {
 
 ================ nginx proxy control ================
  1. 创建新的反向代理站点
+ 2. 申请普通域名证书（Webroot）
+ 3. 申请 Cloudflare 通配证书
+ 4. 列出本机已有证书
+ 5. 禁用站点
  q. 退出
 ====================================================
 每次请输入一个编号
@@ -481,6 +968,10 @@ run_task() {
 
   case "$choice" in
     1) create_proxy_site ;;
+    2) issue_webroot_certificate_interactive ;;
+    3) issue_cloudflare_wildcard_certificate ;;
+    4) list_certificates_action ;;
+    5) disable_site ;;
     *)
       warn "无效选项 [$choice]"
       return 1
@@ -492,7 +983,6 @@ main() {
   local selection
 
   require_root
-  check_environment || exit 1
 
   while true; do
     show_menu

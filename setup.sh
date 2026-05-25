@@ -11,10 +11,13 @@ DOT_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dot.conf"
 PLAIN_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dns.conf"
 BASE_PACKAGES=(vim curl bubblewrap)
 SECURITY_PACKAGES=(ufw fail2ban)
-NGINX_PACKAGES=(nginx certbot)
+NGINX_PACKAGES=(nginx certbot python3-certbot-dns-cloudflare)
 NPCTL_SOURCE_SCRIPT="${SCRIPT_DIR}/nginx_proxy_control.sh"
 NPCTL_TARGET_PATH="/usr/local/bin/npctl"
+CLOUDFLARE_CREDENTIALS_DIR="/root/.secrets/certbot"
 PACKAGE_INDEX_UPDATED=0
+LAST_ENSURE_CREATED=0
+declare -a SAFE_UPDATE_CREATED_FILES=()
 
 log() {
   echo
@@ -55,6 +58,108 @@ install_packages() {
   fi
 
   apt install -y "${packages[@]}" || return 1
+}
+
+package_installed() {
+  local package="$1"
+
+  if ! command_exists "dpkg-query"; then
+    return 1
+  fi
+
+  dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'
+}
+
+install_missing_packages() {
+  local package
+  local -a missing_packages=()
+
+  if ! command_exists "dpkg-query"; then
+    warn "未找到 dpkg-query，将直接尝试安装所需软件包。"
+    install_packages "$@" || return 1
+    return 0
+  fi
+
+  for package in "$@"; do
+    if ! package_installed "$package"; then
+      missing_packages+=("$package")
+    fi
+  done
+
+  if [ "${#missing_packages[@]}" -eq 0 ]; then
+    echo "相关软件包已安装，跳过依赖安装。"
+    return 0
+  fi
+
+  echo "安装缺失软件包: ${missing_packages[*]}"
+  install_packages "${missing_packages[@]}" || return 1
+}
+
+ensure_directory_if_missing() {
+  local target_dir="$1"
+  local owner="${2:-}"
+  local mode="${3:-}"
+
+  LAST_ENSURE_CREATED=0
+
+  if [ -d "$target_dir" ]; then
+    return 0
+  fi
+
+  if [ -e "$target_dir" ] || [ -L "$target_dir" ]; then
+    warn "路径 [$target_dir] 已存在但不是目录，无法自动补齐。"
+    return 1
+  fi
+
+  mkdir -p "$target_dir" || return 1
+  LAST_ENSURE_CREATED=1
+
+  if [ -n "$owner" ]; then
+    chown "$owner" "$target_dir" || return 1
+  fi
+
+  if [ -n "$mode" ]; then
+    chmod "$mode" "$target_dir" || return 1
+  fi
+}
+
+ensure_file_if_missing() {
+  local target_file="$1"
+  local writer_func="$2"
+
+  LAST_ENSURE_CREATED=0
+
+  if [ -d "$target_file" ]; then
+    warn "路径 [$target_file] 已存在但不是普通文件，无法自动补齐。"
+    return 1
+  fi
+
+  if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+    return 0
+  fi
+
+  "$writer_func" || return 1
+  LAST_ENSURE_CREATED=1
+  SAFE_UPDATE_CREATED_FILES+=("$target_file")
+}
+
+rollback_safe_update_created_files() {
+  local idx
+  local target_file
+
+  if [ "${#SAFE_UPDATE_CREATED_FILES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  for ((idx=${#SAFE_UPDATE_CREATED_FILES[@]} - 1; idx >= 0; idx--)); do
+    target_file="${SAFE_UPDATE_CREATED_FILES[$idx]}"
+
+    if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+      rm -f "$target_file" || warn "删除 [$target_file] 失败，请手动检查。"
+    fi
+  done
+
+  SAFE_UPDATE_CREATED_FILES=()
 }
 
 ensure_resolved_ready() {
@@ -626,29 +731,33 @@ server {
 EOF
 }
 
-write_nginx_snippets() {
-  mkdir -p /etc/nginx/snippets || return 1
-
+write_nginx_snippet_acme_webroot() {
   cat > /etc/nginx/snippets/acme-webroot.conf <<'EOF'
 location ^~ /.well-known/acme-challenge/ {
     root /var/www/acme;
     try_files $uri =404;
 }
 EOF
+}
 
+write_nginx_snippet_redirect_https() {
   cat > /etc/nginx/snippets/redirect-https-308.conf <<'EOF'
 location / {
     return 308 https://$host$request_uri;
 }
 EOF
+}
 
+write_nginx_snippet_security_headers() {
   cat > /etc/nginx/snippets/security-headers.conf <<'EOF'
 add_header Strict-Transport-Security "max-age=63072000" always;
 add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options DENY always;
 add_header Referrer-Policy no-referrer always;
 EOF
+}
 
+write_nginx_snippet_proxy_common() {
   cat > /etc/nginx/snippets/proxy-common.conf <<'EOF'
 proxy_http_version 1.1;
 proxy_set_header Host              $host;
@@ -660,13 +769,17 @@ proxy_set_header Connection $connection_upgrade;
 proxy_read_timeout  300;
 proxy_send_timeout  300;
 EOF
+}
 
+write_nginx_snippet_cache_assets() {
   cat > /etc/nginx/snippets/cache-assets.optional.conf <<'EOF'
 expires 30d;
 add_header Cache-Control "public, max-age=2592000, immutable" always;
 access_log off;
 EOF
+}
 
+write_nginx_snippet_proxy_cache_assets() {
   cat > /etc/nginx/snippets/proxy-cache-assets.optional.conf <<'EOF'
 proxy_cache assets_cache;
 proxy_cache_key "$scheme$request_method$host$request_uri";
@@ -678,7 +791,9 @@ proxy_cache_min_uses 1;
 proxy_cache_use_stale error timeout invalid_header updating http_500 http_502 http_503 http_504;
 add_header X-Proxy-Cache $upstream_cache_status always;
 EOF
+}
 
+write_nginx_snippet_block_common_exploits() {
   cat > /etc/nginx/snippets/block-common-exploits.optional.conf <<'EOF'
 location ~ /\.(?!well-known) {
     deny all;
@@ -690,9 +805,19 @@ location ~* \.(?:bak|conf|dist|ini|log|old|orig|save|sql|swp)$ {
 EOF
 }
 
-write_letsencrypt_tls_files() {
-  mkdir -p /etc/letsencrypt || return 1
+write_nginx_snippets() {
+  mkdir -p /etc/nginx/snippets || return 1
 
+  write_nginx_snippet_acme_webroot || return 1
+  write_nginx_snippet_redirect_https || return 1
+  write_nginx_snippet_security_headers || return 1
+  write_nginx_snippet_proxy_common || return 1
+  write_nginx_snippet_cache_assets || return 1
+  write_nginx_snippet_proxy_cache_assets || return 1
+  write_nginx_snippet_block_common_exploits || return 1
+}
+
+write_letsencrypt_options_file() {
   cat > /etc/letsencrypt/options-ssl-nginx.conf <<'EOF'
 ssl_session_cache shared:le_nginx_SSL:10m;
 ssl_session_timeout 1440m;
@@ -701,7 +826,9 @@ ssl_protocols TLSv1.2 TLSv1.3;
 ssl_prefer_server_ciphers off;
 ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
 EOF
+}
 
+write_letsencrypt_dhparams_file() {
   cat > /etc/letsencrypt/ssl-dhparams.pem <<'EOF'
 -----BEGIN DH PARAMETERS-----
 MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
@@ -712,6 +839,13 @@ YdEIqUuyyOP7uWrat2DX9GgdT0Kj3jlN9K5W7edjcrsZCwenyO4KbXCeAvzhzffi
 ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 -----END DH PARAMETERS-----
 EOF
+}
+
+write_letsencrypt_tls_files() {
+  mkdir -p /etc/letsencrypt || return 1
+
+  write_letsencrypt_options_file || return 1
+  write_letsencrypt_dhparams_file || return 1
 }
 
 install_npctl_command() {
@@ -725,8 +859,116 @@ install_npctl_command() {
   chmod 0755 "$NPCTL_TARGET_PATH" || return 1
 }
 
+safe_update_npctl() {
+  local nginx_files_created=0
+
+  log "9. 安全更新 npctl 并补齐缺失依赖"
+  SAFE_UPDATE_CREATED_FILES=()
+
+  install_missing_packages "${NGINX_PACKAGES[@]}" || return 1
+
+  ensure_directory_if_missing /var/cache/nginx || return 1
+  ensure_directory_if_missing /var/cache/nginx/assets_cache "www-data:www-data" || return 1
+  ensure_directory_if_missing /var/www/acme "www-data:www-data" || return 1
+  ensure_directory_if_missing /var/www/acme/.well-known "www-data:www-data" || return 1
+  ensure_directory_if_missing /var/www/acme/.well-known/acme-challenge "www-data:www-data" || return 1
+  ensure_directory_if_missing /etc/nginx/conf.d || return 1
+  ensure_directory_if_missing /etc/nginx/snippets || return 1
+  ensure_directory_if_missing /etc/nginx/sites-available || return 1
+  ensure_directory_if_missing /etc/nginx/sites-enabled || return 1
+  ensure_directory_if_missing /etc/letsencrypt || return 1
+  ensure_directory_if_missing /root/.secrets "" "0700" || return 1
+  ensure_directory_if_missing "$CLOUDFLARE_CREDENTIALS_DIR" "" "0700" || return 1
+
+  ensure_file_if_missing /etc/nginx/conf.d/acme.conf write_nginx_acme_config || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/acme-webroot.conf write_nginx_snippet_acme_webroot || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/redirect-https-308.conf write_nginx_snippet_redirect_https || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/security-headers.conf write_nginx_snippet_security_headers || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/proxy-common.conf write_nginx_snippet_proxy_common || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/cache-assets.optional.conf write_nginx_snippet_cache_assets || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/proxy-cache-assets.optional.conf write_nginx_snippet_proxy_cache_assets || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/nginx/snippets/block-common-exploits.optional.conf write_nginx_snippet_block_common_exploits || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/letsencrypt/options-ssl-nginx.conf write_letsencrypt_options_file || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  ensure_file_if_missing /etc/letsencrypt/ssl-dhparams.pem write_letsencrypt_dhparams_file || return 1
+  if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
+    nginx_files_created=1
+  fi
+
+  log "9.1 安装 npctl 命令"
+  install_npctl_command || return 1
+
+  if [ "$nginx_files_created" -eq 1 ]; then
+    log "检查 Nginx 配置"
+
+    if ! nginx -t; then
+      warn "Nginx 配置校验失败，已删除本次补齐的新建文件。"
+      rollback_safe_update_created_files
+      return 1
+    fi
+
+    if command_exists "systemctl" && systemctl is-active --quiet nginx; then
+      log "重载 Nginx"
+
+      if ! systemctl reload nginx; then
+        warn "Nginx 重载失败，已删除本次补齐的新建文件。"
+        rollback_safe_update_created_files
+        return 1
+      fi
+    else
+      warn "检测到本次补齐了 Nginx 相关文件，但 nginx 服务未运行，已跳过自动重载。"
+    fi
+  fi
+
+  SAFE_UPDATE_CREATED_FILES=()
+
+  echo "已安全更新 npctl。"
+  echo "缺失依赖已安装，已有配置文件未被覆盖。"
+
+  if [ "$nginx_files_created" -eq 1 ]; then
+    echo "本次补齐了缺失的 Nginx / Certbot 基础文件。"
+  else
+    echo "本次未创建新的 Nginx / Certbot 基础文件。"
+  fi
+}
+
 setup_nginx_certbot() {
-  log "8. 安装并配置 Nginx / Certbot"
+  log "8. 安装并配置 Nginx / Certbot / Cloudflare DNS 插件"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
 
   install_packages "${NGINX_PACKAGES[@]}" || return 1
@@ -742,6 +984,9 @@ setup_nginx_certbot() {
   mkdir -p /etc/nginx/snippets || return 1
   mkdir -p /etc/nginx/sites-available || return 1
   mkdir -p /etc/nginx/sites-enabled || return 1
+  mkdir -p "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
+  chmod 0700 /root/.secrets || return 1
+  chmod 0700 "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
 
   if [ -L /etc/nginx/sites-enabled/default ]; then
     unlink /etc/nginx/sites-enabled/default || return 1
@@ -758,13 +1003,6 @@ setup_nginx_certbot() {
   systemctl reload nginx || return 1
 }
 
-install_npctl_only() {
-  log "9. 仅安装 Nginx 反代管理脚本"
-  echo "提示：此操作只安装 /usr/local/bin/npctl，不会安装或配置 Nginx / Certbot。"
-  install_npctl_command || return 1
-  echo "已安装 npctl。使用前请先确保系统已有 Nginx / Certbot 及相关目录配置。"
-}
-
 show_menu() {
   cat <<'EOF'
 
@@ -776,8 +1014,8 @@ show_menu() {
  5. 创建新用户并加入 sudo 组
  6. 安装、配置并验证 Docker
  7. 管理 Swap
- 8. 安装并配置 Nginx / Certbot
- 9. 仅安装 Nginx 反代管理脚本
+ 8. 安装并配置 Nginx / Certbot / Cloudflare DNS 插件
+ 9. 安全更新 npctl 并补齐缺失依赖
  0. 按顺序执行全部
  q. 退出
 ====================================================
@@ -797,7 +1035,7 @@ run_task() {
     6) setup_docker ;;
     7) setup_swap ;;
     8) setup_nginx_certbot ;;
-    9) install_npctl_only ;;
+    9) safe_update_npctl ;;
     *)
       warn "无效选项 [$choice]"
       return 1
