@@ -170,6 +170,18 @@ check_nginx_environment() {
   require_path "$NGINX_SITES_ENABLED_DIR" "请确认 Nginx 安装完整。" || return 1
 }
 
+check_apt_environment() {
+  require_command "apt" "当前系统不支持 apt 包管理。" || return 1
+}
+
+read_nginx_package_version() {
+  if ! command_exists "dpkg-query"; then
+    return 1
+  fi
+
+  dpkg-query -W -f='${Version}' nginx 2>/dev/null
+}
+
 check_site_template_environment() {
   require_path "$ACME_WEBROOT" "请先完成 Nginx / Certbot 安装步骤。" || return 1
   require_path "$NGINX_SNIPPETS_DIR/acme-webroot.conf" "请先完成 Nginx / Certbot 安装步骤。" || return 1
@@ -1558,6 +1570,55 @@ change_site_certificate() {
   echo "新证书: ${SELECTED_CERT_NAME}"
 }
 
+update_nginx_package() {
+  local version_before=""
+  local version_after=""
+  local service_was_active=0
+
+  check_nginx_environment || return 1
+  check_apt_environment || return 1
+
+  version_before="$(read_nginx_package_version || true)"
+  if [ -n "$version_before" ]; then
+    echo "当前 nginx 软件包版本: ${version_before}"
+  fi
+
+  if systemctl is-active --quiet nginx; then
+    service_was_active=1
+  fi
+
+  log "刷新软件包索引"
+  apt update || return 1
+
+  log "升级 nginx 软件包"
+  DEBIAN_FRONTEND=noninteractive apt install --only-upgrade -y nginx || return 1
+
+  version_after="$(read_nginx_package_version || true)"
+  if [ -n "$version_after" ]; then
+    echo "升级后 nginx 软件包版本: ${version_after}"
+  fi
+
+  if [ -n "$version_before" ] && [ -n "$version_after" ]; then
+    if [ "$version_before" = "$version_after" ]; then
+      echo "nginx 软件包已是最新版本。"
+    else
+      echo "nginx 软件包已从 ${version_before} 升级到 ${version_after}。"
+    fi
+  fi
+
+  log "检查 Nginx 配置"
+  nginx -t || return 1
+
+  if [ "$service_was_active" -eq 1 ]; then
+    log "重载 Nginx"
+    systemctl reload nginx || return 1
+    echo "已完成 nginx 更新，配置校验通过并已重载服务。"
+  else
+    warn "未检测到运行中的 nginx，已跳过 reload。"
+    echo "已完成 nginx 更新，配置校验通过。"
+  fi
+}
+
 show_site_state_menu() {
   cat <<'EOF'
 
@@ -1649,6 +1710,7 @@ show_menu() {
  3. 申请 Cloudflare 通配证书
  4. 列出本机已有证书
  5. 站点管理
+ 6. 更新 nginx
  q. 退出
 ====================================================
 每次请输入一个编号
@@ -1664,6 +1726,7 @@ run_task() {
     3) issue_cloudflare_wildcard_certificate ;;
     4) list_certificates_action ;;
     5) manage_sites ;;
+    6) update_nginx_package ;;
     *)
       warn "无效选项 [$choice]"
       return 1
