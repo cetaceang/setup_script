@@ -143,6 +143,27 @@ ensure_file_if_missing() {
   SAFE_UPDATE_CREATED_FILES+=("$target_file")
 }
 
+remove_default_nginx_site() {
+  local default_site="/etc/nginx/sites-enabled/default"
+
+  if [ -L "$default_site" ] || [ -f "$default_site" ]; then
+    rm -f "$default_site" || return 1
+    return 0
+  fi
+
+  if [ ! -e "$default_site" ]; then
+    return 0
+  fi
+
+  if [ -d "$default_site" ]; then
+    warn "路径 [$default_site] 已存在但为目录，无法自动删除。"
+    return 1
+  fi
+
+  warn "路径 [$default_site] 已存在但既不是普通文件也不是符号链接，无法自动删除。"
+  return 1
+}
+
 rollback_safe_update_created_files() {
   local idx
   local target_file
@@ -879,6 +900,7 @@ safe_update_npctl() {
   ensure_directory_if_missing /etc/letsencrypt || return 1
   ensure_directory_if_missing /root/.secrets "" "0700" || return 1
   ensure_directory_if_missing "$CLOUDFLARE_CREDENTIALS_DIR" "" "0700" || return 1
+  remove_default_nginx_site || return 1
 
   ensure_file_if_missing /etc/nginx/conf.d/acme.conf write_nginx_acme_config || return 1
   if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
@@ -987,10 +1009,7 @@ setup_nginx_certbot() {
   mkdir -p "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
   chmod 0700 /root/.secrets || return 1
   chmod 0700 "$CLOUDFLARE_CREDENTIALS_DIR" || return 1
-
-  if [ -L /etc/nginx/sites-enabled/default ]; then
-    unlink /etc/nginx/sites-enabled/default || return 1
-  fi
+  remove_default_nginx_site || return 1
 
   write_nginx_main_config || return 1
   write_nginx_acme_config || return 1
