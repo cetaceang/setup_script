@@ -11,6 +11,7 @@ readonly LETSENCRYPT_DIR="/etc/letsencrypt"
 readonly ASSET_LOCATION_PATTERN='~* \.(?:avif|bmp|css|gif|ico|jpe?g|js|json|mjs|png|svg|txt|webp|woff2?)$'
 readonly CLOUDFLARE_CREDENTIALS_DIR="/root/.secrets/certbot"
 readonly CLOUDFLARE_CREDENTIALS_FILE="${CLOUDFLARE_CREDENTIALS_DIR}/cloudflare.ini"
+readonly NPCTL_MANAGED_MARKER="# Managed by npctl"
 
 SITE_DOMAIN=""
 UPSTREAM_IP=""
@@ -26,6 +27,7 @@ declare -a CERTIFICATE_NAMES=()
 declare -a CERTIFICATE_DOMAINS=()
 declare -a CERTIFICATE_EXPIRIES=()
 declare -a ENABLED_SITE_NAMES=()
+declare -a DISABLED_SITE_NAMES=()
 
 log() {
   echo
@@ -540,7 +542,76 @@ issue_cloudflare_wildcard_certificate() {
   echo "覆盖域名: ${apex_domain} *.${apex_domain}"
 }
 
+certificate_pattern_covers_domain() {
+  local pattern="${1,,}"
+  local domain="${2,,}"
+  local suffix
+  local prefix
+
+  if [ -z "$pattern" ] || [ -z "$domain" ]; then
+    return 1
+  fi
+
+  if [ "$pattern" = "$domain" ]; then
+    return 0
+  fi
+
+  case "$pattern" in
+    \*.*)
+      suffix="${pattern#*.}"
+
+      case "$domain" in
+        *."$suffix")
+          prefix="${domain%.$suffix}"
+
+          if [ -z "$prefix" ]; then
+            return 1
+          fi
+
+          case "$prefix" in
+            *.*) return 1 ;;
+            *) return 0 ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
+}
+
+certificate_covers_domain() {
+  local cert_domains="$1"
+  local domain="${2,,}"
+  local cert_domain
+
+  for cert_domain in $cert_domains; do
+    cert_domain="${cert_domain,,}"
+
+    if certificate_pattern_covers_domain "$cert_domain" "$domain"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_certificate_index_by_name() {
+  local cert_name="$1"
+  local idx
+
+  for idx in "${!CERTIFICATE_NAMES[@]}"; do
+    if [ "${CERTIFICATE_NAMES[$idx]}" = "$cert_name" ]; then
+      printf '%s' "$idx"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 select_certificate() {
+  local target_domain="${1:-$SITE_DOMAIN}"
   local selection
   local index
   local issue_result
@@ -562,12 +633,12 @@ select_certificate() {
       echo " q. 取消"
     fi
 
-    read -rp "请选择要绑定的证书编号: " selection
+    read -rp "请选择要绑定到域名 [${target_domain}] 的证书编号: " selection
     selection="$(trim "$selection")"
 
     case "$selection" in
       n|N)
-        issue_webroot_certificate "$SITE_DOMAIN"
+        issue_webroot_certificate "$target_domain"
         issue_result=$?
 
         case "$issue_result" in
@@ -595,6 +666,12 @@ select_certificate() {
       SELECTED_CERT_NAME="${CERTIFICATE_NAMES[$index]}"
       SELECTED_CERT_DOMAINS="${CERTIFICATE_DOMAINS[$index]}"
       SELECTED_CERT_EXPIRY="${CERTIFICATE_EXPIRIES[$index]}"
+
+      if ! certificate_covers_domain "$SELECTED_CERT_DOMAINS" "$target_domain"; then
+        warn "证书 [${SELECTED_CERT_NAME}] 未覆盖域名 [${target_domain}]，请选择其它证书。"
+        continue
+      fi
+
       return 0
     fi
 
@@ -617,7 +694,7 @@ show_create_site_summary() {
   echo "  block-common-exploits.optional.conf: ${ENABLE_BLOCK_COMMON_EXPLOITS}"
   echo "  proxy-cache-assets.optional.conf: ${ENABLE_PROXY_CACHE_ASSETS}"
   echo "  cache-assets.optional.conf: ${ENABLE_BROWSER_CACHE_HEADERS}"
-  echo "提示: 当前不会校验证书是否覆盖该站点域名，请自行确认。"
+  echo "证书覆盖校验: 已通过"
 }
 
 build_site_config() {
@@ -625,6 +702,8 @@ build_site_config() {
   local upstream_name="$2"
 
   cat > "$site_file" <<EOF
+${NPCTL_MANAGED_MARKER}
+
 upstream ${upstream_name} {
     server ${UPSTREAM_IP}:${UPSTREAM_PORT};
     keepalive 32;
@@ -833,15 +912,189 @@ extract_server_names_from_config() {
   printf '%s' "${server_names:-未解析}"
 }
 
+extract_unique_site_domain_from_config() {
+  local site_file="$1"
+
+  awk '
+    /^[[:space:]]*server_name[[:space:]]+/ {
+      for (i = 2; i <= NF; i++) {
+        gsub(/;/, "", $i)
+
+        if ($i != "" && $i != "_") {
+          names[$i] = 1
+        }
+      }
+    }
+    END {
+      count = 0
+
+      for (name in names) {
+        count++
+        selected = name
+      }
+
+      if (count != 1) {
+        exit 1
+      }
+
+      print selected
+    }
+  ' "$site_file"
+}
+
+extract_cert_name_from_config_directive() {
+  local site_file="$1"
+  local directive="$2"
+  local filename="$3"
+
+  awk -v directive="$directive" -v filename="$filename" '
+    $1 == directive {
+      path = $2
+      sub(/;$/, "", path)
+
+      prefix = "/etc/letsencrypt/live/"
+      suffix = "/" filename
+
+      if (index(path, prefix) != 1) {
+        invalid = 1
+        next
+      }
+
+      name = substr(path, length(prefix) + 1)
+
+      if (length(name) <= length(suffix)) {
+        invalid = 1
+        next
+      }
+
+      if (substr(name, length(name) - length(suffix) + 1) != suffix) {
+        invalid = 1
+        next
+      }
+
+      name = substr(name, 1, length(name) - length(suffix))
+
+      if (name == "") {
+        invalid = 1
+        next
+      }
+
+      names[name] = 1
+    }
+    END {
+      count = 0
+
+      for (name in names) {
+        count++
+        selected = name
+      }
+
+      if (invalid || count != 1) {
+        exit 1
+      }
+
+      print selected
+    }
+  ' "$site_file"
+}
+
+extract_site_certificate_name_from_config() {
+  local site_file="$1"
+  local cert_name
+  local key_name
+
+  cert_name="$(extract_cert_name_from_config_directive "$site_file" "ssl_certificate" "fullchain.pem")" || return 1
+  key_name="$(extract_cert_name_from_config_directive "$site_file" "ssl_certificate_key" "privkey.pem")" || return 1
+
+  if [ "$cert_name" != "$key_name" ]; then
+    return 1
+  fi
+
+  printf '%s' "$cert_name"
+}
+
+is_npctl_legacy_site_file() {
+  local site_file="$1"
+
+  grep -Fq "listen 80;" "$site_file" || return 1
+  grep -Fq "listen 443 ssl http2;" "$site_file" || return 1
+  grep -Fq "include /etc/nginx/snippets/acme-webroot.conf;" "$site_file" || return 1
+  grep -Fq "include /etc/nginx/snippets/redirect-https-308.conf;" "$site_file" || return 1
+  grep -Fq "include /etc/nginx/snippets/security-headers.conf;" "$site_file" || return 1
+  grep -Fq "include /etc/nginx/snippets/proxy-common.conf;" "$site_file" || return 1
+  grep -Fq "location / {" "$site_file" || return 1
+  grep -Fq "proxy_pass http://" "$site_file" || return 1
+}
+
+is_npctl_managed_site_file() {
+  local site_file="$1"
+  local site_name
+
+  if [ ! -f "$site_file" ]; then
+    return 1
+  fi
+
+  site_name="$(basename "$site_file")"
+
+  if [ "$site_name" = "default" ]; then
+    return 1
+  fi
+
+  extract_unique_site_domain_from_config "$site_file" >/dev/null 2>&1 || return 1
+  extract_site_certificate_name_from_config "$site_file" >/dev/null 2>&1 || return 1
+
+  if grep -Fqx "$NPCTL_MANAGED_MARKER" "$site_file"; then
+    return 0
+  fi
+
+  is_npctl_legacy_site_file "$site_file"
+}
+
 load_enabled_sites() {
   local path
+  local site_name
+  local available_file
 
   ENABLED_SITE_NAMES=()
 
   shopt -s nullglob
   for path in "$NGINX_SITES_ENABLED_DIR"/*; do
     [ -L "$path" ] || continue
-    ENABLED_SITE_NAMES+=("$(basename "$path")")
+    site_name="$(basename "$path")"
+    available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+
+    if ! is_npctl_managed_site_file "$available_file"; then
+      continue
+    fi
+
+    ENABLED_SITE_NAMES+=("$site_name")
+  done
+  shopt -u nullglob
+}
+
+load_disabled_sites() {
+  local path
+  local site_name
+  local enabled_file
+
+  DISABLED_SITE_NAMES=()
+
+  shopt -s nullglob
+  for path in "$NGINX_SITES_AVAILABLE_DIR"/*; do
+    [ -f "$path" ] || continue
+
+    site_name="$(basename "$path")"
+    enabled_file="${NGINX_SITES_ENABLED_DIR}/${site_name}"
+
+    if [ -e "$enabled_file" ] || [ -L "$enabled_file" ]; then
+      continue
+    fi
+
+    if ! is_npctl_managed_site_file "$path"; then
+      continue
+    fi
+
+    DISABLED_SITE_NAMES+=("$site_name")
   done
   shopt -u nullglob
 }
@@ -850,18 +1103,135 @@ show_enabled_sites() {
   local idx
   local site_name
   local available_file
+  local cert_name
 
   if [ "${#ENABLED_SITE_NAMES[@]}" -eq 0 ]; then
-    echo "当前没有已启用站点。"
+    echo "当前没有已启用的 npctl 站点。"
     return 0
   fi
 
   for idx in "${!ENABLED_SITE_NAMES[@]}"; do
     site_name="${ENABLED_SITE_NAMES[$idx]}"
     available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+    cert_name="$(extract_site_certificate_name_from_config "$available_file" 2>/dev/null || true)"
     echo " $((idx + 1)). ${site_name}"
     echo "    server_name: $(extract_server_names_from_config "$available_file")"
+
+    if [ -n "$cert_name" ]; then
+      echo "    证书: ${cert_name}"
+    fi
   done
+}
+
+show_disabled_sites() {
+  local idx
+  local site_name
+  local available_file
+  local cert_name
+
+  if [ "${#DISABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    echo "当前没有可启用的 npctl 站点。"
+    return 0
+  fi
+
+  for idx in "${!DISABLED_SITE_NAMES[@]}"; do
+    site_name="${DISABLED_SITE_NAMES[$idx]}"
+    available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+    cert_name="$(extract_site_certificate_name_from_config "$available_file" 2>/dev/null || true)"
+    echo " $((idx + 1)). ${site_name}"
+    echo "    server_name: $(extract_server_names_from_config "$available_file")"
+
+    if [ -n "$cert_name" ]; then
+      echo "    证书: ${cert_name}"
+    fi
+  done
+}
+
+enable_site() {
+  local selection
+  local index
+  local site_name
+  local enabled_file
+  local available_file
+  local server_names
+  local cert_name
+
+  check_nginx_environment || return 1
+  load_disabled_sites
+
+  log "可启用站点"
+  show_disabled_sites
+
+  if [ "${#DISABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要启用的站点编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#DISABLED_SITE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      site_name="${DISABLED_SITE_NAMES[$index]}"
+      break
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+
+  enabled_file="${NGINX_SITES_ENABLED_DIR}/${site_name}"
+  available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+  server_names="$(extract_server_names_from_config "$available_file")"
+  cert_name="$(extract_site_certificate_name_from_config "$available_file" 2>/dev/null || true)"
+
+  log "即将启用以下站点"
+  echo "站点名: ${site_name}"
+  echo "配置文件: ${available_file}"
+  echo "启用链接: ${enabled_file}"
+  echo "server_name: ${server_names}"
+
+  if [ -n "$cert_name" ]; then
+    echo "证书: ${cert_name}"
+  fi
+
+  if ! prompt_yes_no "确认启用此站点" "y"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  if [ -e "$enabled_file" ] || [ -L "$enabled_file" ]; then
+    warn "站点链接 [$enabled_file] 已存在，无法启用。"
+    return 1
+  fi
+
+  ln -s "$available_file" "$enabled_file" || return 1
+
+  log "检查 Nginx 配置"
+  if ! nginx -t; then
+    warn "Nginx 配置校验失败，已回滚本次启用操作。"
+    rm -f "$enabled_file"
+    return 1
+  fi
+
+  log "重载 Nginx"
+  if ! systemctl reload nginx; then
+    warn "Nginx 重载失败，已回滚本次启用操作。"
+    rm -f "$enabled_file"
+    return 1
+  fi
+
+  log "站点已启用"
+  echo "已创建链接: ${enabled_file}"
+  echo "配置文件: ${available_file}"
 }
 
 disable_site() {
@@ -871,6 +1241,7 @@ disable_site() {
   local enabled_file
   local available_file
   local server_names
+  local cert_name
 
   check_nginx_environment || return 1
   load_enabled_sites
@@ -907,12 +1278,17 @@ disable_site() {
   enabled_file="${NGINX_SITES_ENABLED_DIR}/${site_name}"
   available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
   server_names="$(extract_server_names_from_config "$available_file")"
+  cert_name="$(extract_site_certificate_name_from_config "$available_file" 2>/dev/null || true)"
 
   log "即将禁用以下站点"
   echo "站点名: ${site_name}"
   echo "配置文件: ${available_file}"
   echo "启用链接: ${enabled_file}"
   echo "server_name: ${server_names}"
+
+  if [ -n "$cert_name" ]; then
+    echo "证书: ${cert_name}"
+  fi
 
   if ! prompt_yes_no "确认禁用此站点" "n"; then
     echo "已取消。"
@@ -948,6 +1324,322 @@ disable_site() {
   echo "保留配置: ${available_file}"
 }
 
+rewrite_site_certificate_config() {
+  local site_file="$1"
+  local old_cert_name="$2"
+  local new_cert_name="$3"
+  local output_file="$4"
+
+  awk -v old_cert="$old_cert_name" -v new_cert="$new_cert_name" '
+    {
+      line = $0
+
+      if ($1 == "ssl_certificate") {
+        path = $2
+        sub(/;$/, "", path)
+        prefix = "/etc/letsencrypt/live/"
+        suffix = "/fullchain.pem"
+
+        if (index(path, prefix) != 1) {
+          invalid = 1
+        } else {
+          name = substr(path, length(prefix) + 1)
+
+          if (length(name) <= length(suffix) || substr(name, length(name) - length(suffix) + 1) != suffix) {
+            invalid = 1
+          } else {
+            name = substr(name, 1, length(name) - length(suffix))
+
+            if (name != old_cert) {
+              invalid = 1
+            } else {
+              sub(/\/etc\/letsencrypt\/live\/[^/]+\/fullchain\.pem/, "/etc/letsencrypt/live/" new_cert "/fullchain.pem", line)
+              cert_count++
+            }
+          }
+        }
+      } else if ($1 == "ssl_certificate_key") {
+        path = $2
+        sub(/;$/, "", path)
+        prefix = "/etc/letsencrypt/live/"
+        suffix = "/privkey.pem"
+
+        if (index(path, prefix) != 1) {
+          invalid = 1
+        } else {
+          name = substr(path, length(prefix) + 1)
+
+          if (length(name) <= length(suffix) || substr(name, length(name) - length(suffix) + 1) != suffix) {
+            invalid = 1
+          } else {
+            name = substr(name, 1, length(name) - length(suffix))
+
+            if (name != old_cert) {
+              invalid = 1
+            } else {
+              sub(/\/etc\/letsencrypt\/live\/[^/]+\/privkey\.pem/, "/etc/letsencrypt/live/" new_cert "/privkey.pem", line)
+              key_count++
+            }
+          }
+        }
+      }
+
+      print line
+    }
+    END {
+      if (invalid || cert_count != 1 || key_count != 1) {
+        exit 1
+      }
+    }
+  ' "$site_file" > "$output_file"
+}
+
+change_site_certificate() {
+  local selection
+  local index
+  local site_name
+  local available_file
+  local site_domain
+  local current_cert_name
+  local current_cert_index
+  local current_cert_domains=""
+  local current_cert_expiry=""
+  local select_result
+  local backup_file
+  local temp_file
+
+  check_nginx_environment || return 1
+  check_certificate_environment || return 1
+  load_enabled_sites
+
+  log "可更换证书的已启用站点"
+  show_enabled_sites
+
+  if [ "${#ENABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要更换证书的站点编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ENABLED_SITE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      site_name="${ENABLED_SITE_NAMES[$index]}"
+      break
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+
+  available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+  site_domain="$(extract_unique_site_domain_from_config "$available_file")" || {
+    warn "无法从配置文件 [$available_file] 解析唯一站点域名。"
+    return 1
+  }
+  current_cert_name="$(extract_site_certificate_name_from_config "$available_file")" || {
+    warn "无法从配置文件 [$available_file] 解析当前证书。"
+    return 1
+  }
+
+  load_certificates || return 1
+  current_cert_index="$(find_certificate_index_by_name "$current_cert_name" || true)"
+
+  if [ -n "$current_cert_index" ]; then
+    current_cert_domains="${CERTIFICATE_DOMAINS[$current_cert_index]}"
+    current_cert_expiry="${CERTIFICATE_EXPIRIES[$current_cert_index]}"
+  fi
+
+  log "当前站点证书信息"
+  echo "站点名: ${site_name}"
+  echo "配置文件: ${available_file}"
+  echo "站点域名: ${site_domain}"
+  echo "当前证书: ${current_cert_name}"
+  echo "当前证书覆盖域名: ${current_cert_domains:-未在 certbot 列表中找到}"
+
+  if [ -n "$current_cert_expiry" ]; then
+    echo "当前证书到期: ${current_cert_expiry}"
+  fi
+
+  select_certificate "$site_domain"
+  select_result=$?
+
+  case "$select_result" in
+    0) ;;
+    2)
+      echo "已取消。"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  if [ "$SELECTED_CERT_NAME" = "$current_cert_name" ]; then
+    echo "所选证书与当前证书一致，无需修改。"
+    return 0
+  fi
+
+  log "即将切换站点证书"
+  echo "站点名: ${site_name}"
+  echo "站点域名: ${site_domain}"
+  echo "当前证书: ${current_cert_name}"
+  echo "新证书: ${SELECTED_CERT_NAME}"
+  echo "新证书覆盖域名: ${SELECTED_CERT_DOMAINS}"
+
+  if [ -n "$SELECTED_CERT_EXPIRY" ]; then
+    echo "新证书到期: ${SELECTED_CERT_EXPIRY}"
+  fi
+
+  if ! prompt_yes_no "确认切换此站点使用的证书" "y"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  backup_file="$(mktemp /tmp/npctl-site-backup.XXXXXX.conf)" || return 1
+  cp "$available_file" "$backup_file" || {
+    rm -f "$backup_file"
+    return 1
+  }
+
+  temp_file="$(mktemp /tmp/npctl-site-edit.XXXXXX.conf)" || {
+    rm -f "$backup_file"
+    return 1
+  }
+
+  rewrite_site_certificate_config "$available_file" "$current_cert_name" "$SELECTED_CERT_NAME" "$temp_file" || {
+    warn "仅支持更换 npctl 模板配置中的单组证书引用。"
+    rm -f "$temp_file" "$backup_file"
+    return 1
+  }
+
+  mv "$temp_file" "$available_file" || {
+    rm -f "$temp_file" "$backup_file"
+    return 1
+  }
+
+  log "检查 Nginx 配置"
+  if ! nginx -t; then
+    warn "Nginx 配置校验失败，已恢复原证书配置。"
+
+    if ! mv "$backup_file" "$available_file"; then
+      warn "恢复配置文件失败，请立即手动检查 [$available_file]。"
+    fi
+
+    return 1
+  fi
+
+  log "重载 Nginx"
+  if ! systemctl reload nginx; then
+    warn "Nginx 重载失败，已恢复原证书配置。"
+
+    if ! mv "$backup_file" "$available_file"; then
+      warn "恢复配置文件失败，请立即手动检查 [$available_file]。"
+    fi
+
+    return 1
+  fi
+
+  rm -f "$backup_file"
+
+  log "站点证书已更新"
+  echo "站点名: ${site_name}"
+  echo "站点域名: ${site_domain}"
+  echo "原证书: ${current_cert_name}"
+  echo "新证书: ${SELECTED_CERT_NAME}"
+}
+
+show_site_state_menu() {
+  cat <<'EOF'
+
+---------------- 站点启用/禁用 ----------------
+ 1. 启用站点
+ 2. 禁用站点
+ q. 返回上级菜单
+----------------------------------------------
+EOF
+}
+
+manage_site_state() {
+  local selection
+
+  while true; do
+    show_site_state_menu
+    read -rp "请输入要执行的编号: " selection
+
+    if [ -z "${selection}" ]; then
+      warn "未输入任何选项，请重新输入。"
+      continue
+    fi
+
+    case "$selection" in
+      1) enable_site ;;
+      2) disable_site ;;
+      q|Q)
+        echo "已返回上级菜单。"
+        return 0
+        ;;
+      *)
+        warn "无效选项 [$selection]"
+        continue
+        ;;
+    esac
+
+    echo
+    echo "本次站点状态操作完成。"
+  done
+}
+
+show_site_management_menu() {
+  cat <<'EOF'
+
+================ 站点管理 ================
+ 1. 启用/禁用站点
+ 2. 更换已有站点证书
+ q. 返回上级菜单
+==========================================
+EOF
+}
+
+manage_sites() {
+  local selection
+
+  while true; do
+    show_site_management_menu
+    read -rp "请输入要执行的编号: " selection
+
+    if [ -z "${selection}" ]; then
+      warn "未输入任何选项，请重新输入。"
+      continue
+    fi
+
+    case "$selection" in
+      1) manage_site_state ;;
+      2) change_site_certificate ;;
+      q|Q)
+        echo "已返回主菜单。"
+        return 0
+        ;;
+      *)
+        warn "无效选项 [$selection]"
+        continue
+        ;;
+    esac
+
+    echo
+    echo "本次站点管理操作完成。"
+  done
+}
+
 show_menu() {
   cat <<'EOF'
 
@@ -956,7 +1648,7 @@ show_menu() {
  2. 申请普通域名证书（Webroot）
  3. 申请 Cloudflare 通配证书
  4. 列出本机已有证书
- 5. 禁用站点
+ 5. 站点管理
  q. 退出
 ====================================================
 每次请输入一个编号
@@ -971,7 +1663,7 @@ run_task() {
     2) issue_webroot_certificate_interactive ;;
     3) issue_cloudflare_wildcard_certificate ;;
     4) list_certificates_action ;;
-    5) disable_site ;;
+    5) manage_sites ;;
     *)
       warn "无效选项 [$choice]"
       return 1
