@@ -27,6 +27,7 @@ SELECTED_CERT_EXPIRY=""
 declare -a CERTIFICATE_NAMES=()
 declare -a CERTIFICATE_DOMAINS=()
 declare -a CERTIFICATE_EXPIRIES=()
+declare -a CERTIFICATE_REFERENCED_SITE_NAMES=()
 declare -a ENABLED_SITE_NAMES=()
 declare -a DISABLED_SITE_NAMES=()
 
@@ -403,6 +404,124 @@ list_certificates_action() {
 
   log "本机已有证书"
   show_certificates_list
+}
+
+load_certificate_referenced_sites() {
+  local cert_name="$1"
+  local path
+  local site_name
+  local site_cert_name
+
+  CERTIFICATE_REFERENCED_SITE_NAMES=()
+
+  shopt -s nullglob
+  for path in "$NGINX_SITES_AVAILABLE_DIR"/*; do
+    [ -f "$path" ] || continue
+
+    if ! is_npctl_managed_site_file "$path"; then
+      continue
+    fi
+
+    site_cert_name="$(extract_site_certificate_name_from_config "$path" 2>/dev/null || true)"
+
+    if [ "$site_cert_name" != "$cert_name" ]; then
+      continue
+    fi
+
+    site_name="$(basename "$path")"
+    CERTIFICATE_REFERENCED_SITE_NAMES+=("$site_name")
+  done
+  shopt -u nullglob
+}
+
+show_certificate_referenced_sites() {
+  local idx
+
+  if [ "${#CERTIFICATE_REFERENCED_SITE_NAMES[@]}" -eq 0 ]; then
+    echo "当前没有站点引用该证书。"
+    return 0
+  fi
+
+  for idx in "${!CERTIFICATE_REFERENCED_SITE_NAMES[@]}"; do
+    echo " $((idx + 1)). ${CERTIFICATE_REFERENCED_SITE_NAMES[$idx]}"
+  done
+}
+
+delete_certificate_action() {
+  local selection
+  local index
+  local cert_name
+  local cert_domains
+  local cert_expiry
+
+  check_certificate_environment || return 1
+  load_certificates || return 1
+
+  log "请选择要删除的证书"
+  show_certificates_list
+
+  if [ "${#CERTIFICATE_NAMES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要删除的证书编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#CERTIFICATE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      break
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+
+  cert_name="${CERTIFICATE_NAMES[$index]}"
+  cert_domains="${CERTIFICATE_DOMAINS[$index]}"
+  cert_expiry="${CERTIFICATE_EXPIRIES[$index]}"
+
+  load_certificate_referenced_sites "$cert_name"
+
+  if [ "${#CERTIFICATE_REFERENCED_SITE_NAMES[@]}" -ne 0 ]; then
+    warn "证书 [$cert_name] 仍被以下站点引用，无法删除。"
+    show_certificate_referenced_sites
+    echo "请先在站点管理中更换这些站点使用的证书，或手动调整配置后再删除。"
+    return 1
+  fi
+
+  log "即将删除以下证书"
+  echo "证书: ${cert_name}"
+  echo "覆盖域名: ${cert_domains:-未解析}"
+
+  if [ -n "$cert_expiry" ]; then
+    echo "到期: ${cert_expiry}"
+  fi
+
+  echo "说明: 删除后 Certbot 将不再管理该证书，后续不会再自动续期。"
+
+  if ! prompt_yes_no "确认删除此证书" "n"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  log "删除证书"
+  certbot delete --cert-name "$cert_name" || {
+    warn "删除证书 [$cert_name] 失败。"
+    return 1
+  }
+
+  log "证书已删除"
+  echo "证书: ${cert_name}"
+  echo "说明: Certbot 已停止管理该证书，后续不会再自动续期。"
 }
 
 write_cloudflare_credentials() {
@@ -2177,16 +2296,59 @@ manage_sites() {
   done
 }
 
+show_certificate_management_menu() {
+  cat <<'EOF'
+
+================ 证书管理 ================
+ 1. 申请普通域名证书（Webroot）
+ 2. 申请 Cloudflare 通配证书
+ 3. 列出本机已有证书
+ 4. 删除已有证书
+ q. 返回上级菜单
+==========================================
+EOF
+}
+
+manage_certificates() {
+  local selection
+
+  while true; do
+    show_certificate_management_menu
+    read -rp "请输入要执行的编号: " selection
+
+    if [ -z "${selection}" ]; then
+      warn "未输入任何选项，请重新输入。"
+      continue
+    fi
+
+    case "$selection" in
+      1) issue_webroot_certificate_interactive ;;
+      2) issue_cloudflare_wildcard_certificate ;;
+      3) list_certificates_action ;;
+      4) delete_certificate_action ;;
+      q|Q)
+        echo "已返回主菜单。"
+        return 0
+        ;;
+      *)
+        warn "无效选项 [$selection]"
+        continue
+        ;;
+    esac
+
+    echo
+    echo "本次证书管理操作完成。"
+  done
+}
+
 show_menu() {
   cat <<'EOF'
 
 ================ nginx proxy control ================
  1. 创建新的反向代理站点
- 2. 申请普通域名证书（Webroot）
- 3. 申请 Cloudflare 通配证书
- 4. 列出本机已有证书
- 5. 站点管理
- 6. 更新 nginx
+ 2. 证书管理
+ 3. 站点管理
+ 4. 更新 nginx
  q. 退出
 ====================================================
 每次请输入一个编号
@@ -2198,11 +2360,9 @@ run_task() {
 
   case "$choice" in
     1) create_proxy_site ;;
-    2) issue_webroot_certificate_interactive ;;
-    3) issue_cloudflare_wildcard_certificate ;;
-    4) list_certificates_action ;;
-    5) manage_sites ;;
-    6) update_nginx_package ;;
+    2) manage_certificates ;;
+    3) manage_sites ;;
+    4) update_nginx_package ;;
     *)
       warn "无效选项 [$choice]"
       return 1
