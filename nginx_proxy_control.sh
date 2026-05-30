@@ -19,6 +19,7 @@ UPSTREAM_PORT=""
 ENABLE_BLOCK_COMMON_EXPLOITS=0
 ENABLE_PROXY_CACHE_ASSETS=0
 ENABLE_BROWSER_CACHE_HEADERS=0
+CLIENT_MAX_BODY_SIZE=""
 SELECTED_CERT_NAME=""
 SELECTED_CERT_DOMAINS=""
 SELECTED_CERT_EXPIRY=""
@@ -202,6 +203,7 @@ reset_create_site_state() {
   ENABLE_BLOCK_COMMON_EXPLOITS=0
   ENABLE_PROXY_CACHE_ASSETS=0
   ENABLE_BROWSER_CACHE_HEADERS=0
+  CLIENT_MAX_BODY_SIZE=""
   SELECTED_CERT_NAME=""
   SELECTED_CERT_DOMAINS=""
   SELECTED_CERT_EXPIRY=""
@@ -257,6 +259,48 @@ collect_upstream() {
 
     warn "端口范围必须在 1-65535。"
   done
+}
+
+normalize_client_max_body_size() {
+  local value
+
+  value="$(trim "$1")"
+  printf '%s' "${value^^}"
+}
+
+validate_client_max_body_size() {
+  local value
+
+  value="$(normalize_client_max_body_size "$1")"
+
+  [[ "$value" = "0" || "$value" =~ ^[1-9][0-9]*[KMG]$ ]]
+}
+
+prompt_client_max_body_size_value() {
+  local input
+  local normalized
+
+  while true; do
+    read -rp "请输入 client_max_body_size 的值（例如 1024M、2G、0）: " input
+    normalized="$(normalize_client_max_body_size "$input")"
+
+    if validate_client_max_body_size "$normalized"; then
+      printf '%s' "$normalized"
+      return 0
+    fi
+
+    warn "client_max_body_size 仅支持 0 或正整数加单位 K/M/G，例如 64M、2G。"
+  done
+}
+
+collect_optional_client_max_body_size() {
+  CLIENT_MAX_BODY_SIZE=""
+
+  if ! prompt_yes_no "是否设置 client_max_body_size"; then
+    return 0
+  fi
+
+  CLIENT_MAX_BODY_SIZE="$(prompt_client_max_body_size_value)" || return 1
 }
 
 collect_optional_snippets() {
@@ -679,11 +723,6 @@ select_certificate() {
       SELECTED_CERT_DOMAINS="${CERTIFICATE_DOMAINS[$index]}"
       SELECTED_CERT_EXPIRY="${CERTIFICATE_EXPIRIES[$index]}"
 
-      if ! certificate_covers_domain "$SELECTED_CERT_DOMAINS" "$target_domain"; then
-        warn "证书 [${SELECTED_CERT_NAME}] 未覆盖域名 [${target_domain}]，请选择其它证书。"
-        continue
-      fi
-
       return 0
     fi
 
@@ -702,11 +741,12 @@ show_create_site_summary() {
   fi
 
   echo "反代目标: ${UPSTREAM_IP}:${UPSTREAM_PORT}"
+  echo "client_max_body_size: ${CLIENT_MAX_BODY_SIZE:-未设置}"
   echo "可选 snippets:"
   echo "  block-common-exploits.optional.conf: ${ENABLE_BLOCK_COMMON_EXPLOITS}"
   echo "  proxy-cache-assets.optional.conf: ${ENABLE_PROXY_CACHE_ASSETS}"
   echo "  cache-assets.optional.conf: ${ENABLE_BROWSER_CACHE_HEADERS}"
-  echo "证书覆盖校验: 已通过"
+  echo "证书覆盖校验: 已禁用，请自行确认"
 }
 
 build_site_config() {
@@ -732,6 +772,16 @@ server {
 server {
     listen 443 ssl http2;
     server_name ${SITE_DOMAIN};
+EOF
+
+  if [ -n "$CLIENT_MAX_BODY_SIZE" ]; then
+    cat >> "$site_file" <<EOF
+
+    client_max_body_size ${CLIENT_MAX_BODY_SIZE};
+EOF
+  fi
+
+  cat >> "$site_file" <<EOF
 
     ssl_certificate     /etc/letsencrypt/live/${SELECTED_CERT_NAME}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${SELECTED_CERT_NAME}/privkey.pem;
@@ -828,6 +878,7 @@ create_proxy_site() {
   esac
 
   collect_upstream || return 1
+  collect_optional_client_max_body_size || return 1
   collect_optional_snippets || return 1
   show_create_site_summary
 
@@ -1023,6 +1074,248 @@ extract_site_certificate_name_from_config() {
   fi
 
   printf '%s' "$cert_name"
+}
+
+extract_site_client_max_body_size() {
+  local site_file="$1"
+
+  awk '
+    function brace_delta(line,    opens, closes, text) {
+      text = line
+      opens = gsub(/\{/, "{", text)
+      closes = gsub(/\}/, "}", text)
+      return opens - closes
+    }
+
+    function flush_server_block(    i, value, server_name_idx, ssl_idx, invalid_region) {
+      if (!in_server) {
+        return
+      }
+
+      if (target_server) {
+        target_count++
+
+        for (i = 1; i <= line_count; i++) {
+          if (lines[i] ~ /^[[:space:]]*server_name[[:space:]]+/) {
+            if (server_name_idx == 0) {
+              server_name_idx = i
+            } else {
+              invalid = 1
+            }
+          }
+
+          if (lines[i] ~ /^[[:space:]]*ssl_certificate[[:space:]]+/ && ssl_idx == 0) {
+            ssl_idx = i
+          }
+        }
+
+        if (server_name_idx == 0 || ssl_idx == 0 || ssl_idx <= server_name_idx) {
+          invalid = 1
+        }
+
+        for (i = server_name_idx + 1; i < ssl_idx; i++) {
+          if (lines[i] ~ /^[[:space:]]*$/) {
+            continue
+          }
+
+          if (lines[i] ~ /^[[:space:]]*client_max_body_size[[:space:]]+/) {
+            value = lines[i]
+            sub(/^[[:space:]]*client_max_body_size[[:space:]]+/, "", value)
+            sub(/[[:space:]]*;[[:space:]]*$/, "", value)
+            client_count++
+            client_value = value
+            continue
+          }
+
+          invalid_region = 1
+        }
+
+        if (invalid_region) {
+          invalid = 1
+        }
+
+      }
+
+      delete lines
+      line_count = 0
+      in_server = 0
+      target_server = 0
+      server_depth = 0
+    }
+
+    /^[[:space:]]*server[[:space:]]*\{/ {
+      flush_server_block()
+      in_server = 1
+      line_count = 0
+      target_server = 0
+      server_depth = 0
+    }
+
+    {
+      if (!in_server) {
+        next
+      }
+
+      lines[++line_count] = $0
+
+      if ($0 ~ /^[[:space:]]*listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
+        target_server = 1
+      }
+
+      server_depth += brace_delta($0)
+
+      if (server_depth <= 0) {
+        flush_server_block()
+      }
+    }
+
+    END {
+      flush_server_block()
+
+      if (invalid || target_count != 1 || client_count > 1) {
+        exit 1
+      }
+
+      if (client_count == 1) {
+        print client_value
+      }
+    }
+  ' "$site_file"
+}
+
+rewrite_site_client_max_body_size_config() {
+  local site_file="$1"
+  local mode="$2"
+  local client_max_body_size="$3"
+  local output_file="$4"
+
+  awk -v mode="$mode" -v client_max_body_size="$client_max_body_size" '
+    function brace_delta(line,    opens, closes, text) {
+      text = line
+      opens = gsub(/\{/, "{", text)
+      closes = gsub(/\}/, "}", text)
+      return opens - closes
+    }
+
+    function reset_server_state() {
+      delete lines
+      line_count = 0
+      in_server = 0
+      target_server = 0
+      server_depth = 0
+    }
+
+    function print_server_block(    i, server_name_idx, ssl_idx, client_count, invalid_region) {
+      if (!in_server) {
+        return
+      }
+
+      if (!target_server) {
+        for (i = 1; i <= line_count; i++) {
+          print lines[i]
+        }
+
+        reset_server_state()
+        return
+      }
+
+      target_count++
+
+      for (i = 1; i <= line_count; i++) {
+        if (lines[i] ~ /^[[:space:]]*server_name[[:space:]]+/) {
+          if (server_name_idx == 0) {
+            server_name_idx = i
+          } else {
+            invalid = 1
+          }
+        }
+
+        if (lines[i] ~ /^[[:space:]]*ssl_certificate[[:space:]]+/ && ssl_idx == 0) {
+          ssl_idx = i
+        }
+
+      }
+
+      if (server_name_idx == 0 || ssl_idx == 0 || ssl_idx <= server_name_idx) {
+        invalid = 1
+      }
+
+      for (i = server_name_idx + 1; i < ssl_idx; i++) {
+        if (lines[i] ~ /^[[:space:]]*$/) {
+          continue
+        }
+
+        if (lines[i] ~ /^[[:space:]]*client_max_body_size[[:space:]]+/) {
+          client_count++
+          continue
+        }
+
+        invalid_region = 1
+      }
+
+      if (invalid_region || client_count > 1) {
+        invalid = 1
+      }
+
+      if (invalid) {
+        reset_server_state()
+        return
+      }
+
+      for (i = 1; i <= server_name_idx; i++) {
+        print lines[i]
+      }
+
+      print ""
+
+      if (mode == "set") {
+        print "    client_max_body_size " client_max_body_size ";"
+        print ""
+      }
+
+      for (i = ssl_idx; i <= line_count; i++) {
+        print lines[i]
+      }
+
+      modified = 1
+      reset_server_state()
+    }
+
+    /^[[:space:]]*server[[:space:]]*\{/ {
+      print_server_block()
+      in_server = 1
+      line_count = 0
+      target_server = 0
+      server_depth = 0
+    }
+
+    {
+      if (!in_server) {
+        print
+        next
+      }
+
+      lines[++line_count] = $0
+
+      if ($0 ~ /^[[:space:]]*listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
+        target_server = 1
+      }
+
+      server_depth += brace_delta($0)
+
+      if (server_depth <= 0) {
+        print_server_block()
+      }
+    }
+
+    END {
+      print_server_block()
+
+      if (invalid || target_count != 1 || !modified) {
+        exit 1
+      }
+    }
+  ' "$site_file" > "$output_file"
 }
 
 is_npctl_legacy_site_file() {
@@ -1570,6 +1863,173 @@ change_site_certificate() {
   echo "新证书: ${SELECTED_CERT_NAME}"
 }
 
+change_site_client_max_body_size() {
+  local selection
+  local index
+  local site_name
+  local available_file
+  local site_domain
+  local current_client_max_body_size=""
+  local new_client_max_body_size=""
+  local backup_file
+  local temp_file
+  local action
+
+  check_nginx_environment || return 1
+  load_enabled_sites
+
+  log "可修改上传大小限制的已启用站点"
+  show_enabled_sites
+
+  if [ "${#ENABLED_SITE_NAMES[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要修改的站点编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+    esac
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ENABLED_SITE_NAMES[@]}" ]; then
+      index=$((selection - 1))
+      site_name="${ENABLED_SITE_NAMES[$index]}"
+      break
+    fi
+
+    warn "无效选项 [$selection]。"
+  done
+
+  available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+  site_domain="$(extract_unique_site_domain_from_config "$available_file")" || {
+    warn "无法从配置文件 [$available_file] 解析唯一站点域名。"
+    return 1
+  }
+  current_client_max_body_size="$(extract_site_client_max_body_size "$available_file" 2>/dev/null || true)"
+
+  if [ -n "$current_client_max_body_size" ]; then
+    current_client_max_body_size="$(normalize_client_max_body_size "$current_client_max_body_size")"
+  fi
+
+  log "当前站点上传大小限制"
+  echo "站点名: ${site_name}"
+  echo "配置文件: ${available_file}"
+  echo "站点域名: ${site_domain}"
+  echo "当前 client_max_body_size: ${current_client_max_body_size:-未设置}"
+  echo " 1. 设置或修改 client_max_body_size"
+  echo " 2. 删除 client_max_body_size"
+  echo " q. 取消"
+
+  while true; do
+    read -rp "请选择要执行的编号: " selection
+    selection="$(trim "$selection")"
+
+    case "$selection" in
+      1)
+        action="set"
+        new_client_max_body_size="$(prompt_client_max_body_size_value)" || return 1
+        break
+        ;;
+      2)
+        action="remove"
+        break
+        ;;
+      q|Q)
+        echo "已取消。"
+        return 0
+        ;;
+      *)
+        warn "无效选项 [$selection]。"
+        ;;
+    esac
+  done
+
+  if [ "$action" = "remove" ] && [ -z "$current_client_max_body_size" ]; then
+    echo "当前未设置 client_max_body_size，无需修改。"
+    return 0
+  fi
+
+  log "即将修改站点上传大小限制"
+  echo "站点名: ${site_name}"
+  echo "站点域名: ${site_domain}"
+  echo "当前 client_max_body_size: ${current_client_max_body_size:-未设置}"
+
+  if [ "$action" = "set" ]; then
+    echo "新 client_max_body_size: ${new_client_max_body_size}"
+  else
+    echo "新 client_max_body_size: 未设置"
+  fi
+
+  if ! prompt_yes_no "确认修改此站点的 client_max_body_size" "y"; then
+    echo "已取消。"
+    return 0
+  fi
+
+  backup_file="$(mktemp /tmp/npctl-site-backup.XXXXXX.conf)" || return 1
+  cp "$available_file" "$backup_file" || {
+    rm -f "$backup_file"
+    return 1
+  }
+
+  temp_file="$(mktemp /tmp/npctl-site-edit.XXXXXX.conf)" || {
+    rm -f "$backup_file"
+    return 1
+  }
+
+  rewrite_site_client_max_body_size_config "$available_file" "$action" "$new_client_max_body_size" "$temp_file" || {
+    warn "仅支持修改 npctl 模板站点中 443 server 块里的 client_max_body_size。"
+    rm -f "$temp_file" "$backup_file"
+    return 1
+  }
+
+  mv "$temp_file" "$available_file" || {
+    rm -f "$temp_file" "$backup_file"
+    return 1
+  }
+
+  log "检查 Nginx 配置"
+  if ! nginx -t; then
+    warn "Nginx 配置校验失败，已恢复原站点配置。"
+
+    if ! mv "$backup_file" "$available_file"; then
+      warn "恢复配置文件失败，请立即手动检查 [$available_file]。"
+    fi
+
+    return 1
+  fi
+
+  log "重载 Nginx"
+  if ! systemctl reload nginx; then
+    warn "Nginx 重载失败，已恢复原站点配置。"
+
+    if ! mv "$backup_file" "$available_file"; then
+      warn "恢复配置文件失败，请立即手动检查 [$available_file]。"
+    fi
+
+    return 1
+  fi
+
+  rm -f "$backup_file"
+
+  log "站点上传大小限制已更新"
+  echo "站点名: ${site_name}"
+  echo "站点域名: ${site_domain}"
+  echo "原 client_max_body_size: ${current_client_max_body_size:-未设置}"
+
+  if [ "$action" = "set" ]; then
+    echo "新 client_max_body_size: ${new_client_max_body_size}"
+  else
+    echo "新 client_max_body_size: 未设置"
+  fi
+}
+
 update_nginx_package() {
   local version_before=""
   local version_after=""
@@ -1666,6 +2126,7 @@ show_site_management_menu() {
 ================ 站点管理 ================
  1. 启用/禁用站点
  2. 更换已有站点证书
+ 3. 设置站点 client_max_body_size
  q. 返回上级菜单
 ==========================================
 EOF
@@ -1686,6 +2147,7 @@ manage_sites() {
     case "$selection" in
       1) manage_site_state ;;
       2) change_site_certificate ;;
+      3) change_site_client_max_body_size ;;
       q|Q)
         echo "已返回主菜单。"
         return 0
