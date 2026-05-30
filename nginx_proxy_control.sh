@@ -480,10 +480,24 @@ collect_wildcard_apex_domain() {
 }
 
 run_certbot_renew_dry_run() {
+  local cert_name="${1:-}"
+  local -a certbot_args=(certbot renew --dry-run)
+
   log "执行 Certbot 续期演练"
 
-  if ! certbot renew --dry-run; then
-    warn "续期演练失败，请稍后手动检查 certbot renew --dry-run。"
+  if [ -n "$cert_name" ]; then
+    echo "目标证书: ${cert_name}"
+    certbot_args+=(--cert-name "$cert_name")
+  else
+    echo "目标证书: 全部证书"
+  fi
+
+  if ! "${certbot_args[@]}"; then
+    if [ -n "$cert_name" ]; then
+      warn "证书 [$cert_name] 续期演练失败，请稍后手动检查 certbot renew --dry-run --cert-name ${cert_name}。"
+    else
+      warn "续期演练失败，请稍后手动检查 certbot renew --dry-run。"
+    fi
   fi
 }
 
@@ -539,7 +553,7 @@ issue_webroot_certificate() {
   log "申请 Webroot 证书"
   "${certbot_args[@]}" || return 1
 
-  run_certbot_renew_dry_run
+  run_certbot_renew_dry_run "$cert_domain"
 
   log "证书申请完成"
   echo "cert-name: ${cert_domain}"
@@ -591,7 +605,7 @@ issue_cloudflare_wildcard_certificate() {
   log "申请 Cloudflare 通配证书"
   "${certbot_args[@]}" || return 1
 
-  run_certbot_renew_dry_run
+  run_certbot_renew_dry_run "$apex_domain"
 
   log "证书申请完成"
   echo "cert-name: ${apex_domain}"
@@ -935,7 +949,7 @@ create_proxy_site() {
     return 1
   fi
 
-  run_certbot_renew_dry_run
+  run_certbot_renew_dry_run "$SELECTED_CERT_NAME"
 
   log "站点创建完成"
   echo "站点文件: ${available_file}"
