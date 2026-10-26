@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+LOCAL_FALLBACK_MARKER = '# Managed by npctl local-only HTTPS fallback'
+
 
 def tokens(text):
     i = 0
@@ -90,6 +92,17 @@ def port(address):
     return int(match[1]) if match else None
 
 
+def local_only_fallback(text):
+    if LOCAL_FALLBACK_MARKER not in text.splitlines():
+        return False
+    entries = listeners(text)
+    if (https_server_count(text) != 1 or len(entries) != 1 or
+            len(entries[0][0]) < 3 or entries[0][0][1][0] != '127.0.0.1:8443' or
+            'ssl' not in [part[0] for part in entries[0][0][2:]]):
+        raise ValueError('本地专用 HTTPS 回落站点的监听与标记不符，停止操作')
+    return True
+
+
 def migrate(paths, metadata_path, enable):
     metadata_file = Path(metadata_path)
     metadata = json.loads(metadata_file.read_text()) if metadata_file.exists() else {}
@@ -104,6 +117,9 @@ def migrate(paths, metadata_path, enable):
         if path.is_symlink() or not path.is_file():
             raise ValueError(f'拒绝修改非常规站点文件: {name}')
         text = path.read_text()
+        if local_only_fallback(text):
+            # Landing-server HTTPS is independent of public Stream state.
+            continue
         if https_server_count(text) != 1:
             raise ValueError(f'站点不包含唯一的受支持 HTTPS server 块: {name}')
         selected = []
@@ -167,6 +183,8 @@ def probe(dump_path, allowed_paths, managed_stream):
     for name, text in sections.items():
         if name == os.path.realpath(managed_stream):
             continue
+        if name in allowed:
+            local_only_fallback(text)
         for parts, delimiter, _, _ in directives(text):
             if parts[0][0] == 'stream' and delimiter == '{':
                 raise ValueError(f'检测到第三方 stream 配置，停止操作: {name}')

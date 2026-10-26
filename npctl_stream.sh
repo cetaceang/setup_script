@@ -9,12 +9,13 @@ NPCTL_FALLBACK_ROOT="${NPCTL_FALLBACK_ROOT:-/var/www/npctl-fallback}"
 NPCTL_STREAM_PARSER="${NPCTL_STREAM_PARSER:-${BASH_SOURCE[0]%/*}/npctl_stream_config.py}"
 STREAM_INCLUDE="include $NPCTL_STREAM_DIR/stream.conf; # Managed by npctl SNI"
 STREAM_FALLBACK_MARKER='# Managed by npctl fallback website'
+STREAM_LOCAL_FALLBACK_MARKER='# Managed by npctl local-only HTTPS fallback'
 declare -a STREAM_SITES=() STREAM_SNAPSHOT_PATHS=()
 
 stream_validate_ownership() {
   local path have_metadata=0
   [[ ! -L $NPCTL_STREAM_DIR ]] || { warn 'SNI 配置目录不能是符号链接。'; return 1; }
-  for path in .owner enabled stream.conf nodes.tsv listeners.json; do
+  for path in .owner enabled stream.conf nodes.tsv node-modes.tsv listeners.json; do
     [[ ! -L $NPCTL_STREAM_DIR/$path && ( ! -e $NPCTL_STREAM_DIR/$path || -f $NPCTL_STREAM_DIR/$path ) ]] || {
       warn "SNI 元数据路径不兼容: $path"; return 1;
     }
@@ -28,6 +29,10 @@ stream_validate_ownership() {
   fi
   if [[ -f $NPCTL_STREAM_DIR/stream.conf ]] && ! grep -Fqx '# Managed by npctl SNI; edit with npctl.' "$NPCTL_STREAM_DIR/stream.conf"; then
     warn 'Stream 配置不属于 npctl，拒绝覆盖。'; return 1
+  fi
+  if [[ -f $NPCTL_STREAM_DIR/node-modes.tsv ]] && ! awk -F '\t' \
+      'NF != 2 || ($2 != "relay" && $2 != "local") || seen[$1]++ {exit 1}' "$NPCTL_STREAM_DIR/node-modes.tsv"; then
+    warn '节点部署方式元数据格式不兼容，停止操作。'; return 1
   fi
 }
 
@@ -53,12 +58,12 @@ stream_guard_disable_site() {
   local site=$1 domain path count=0
   stream_enabled || return 0
   domain=$(extract_unique_site_domain_from_config "$site") || return 1
-  if [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] && awk -F '\t' -v domain="$domain" '$1 == domain {found=1} END {exit !found}' "$NPCTL_STREAM_DIR/nodes.tsv"; then
-    warn '该网站仍被 SNI 节点用作 HTTPS 回落，请先删除映射。'; return 1
+  if stream_needs_local_fallback "$domain"; then
+    warn '该网站仍被同机节点用作 HTTPS 回落，请先删除映射或将节点切换为纯中转。'; return 1
   fi
   stream_collect_sites || return 1
   for path in "${STREAM_SITES[@]}"; do [[ ! -e $NGINX_SITES_ENABLED_DIR/${path##*/} ]] || count=$((count + 1)); done
-  [[ $count -gt 1 ]] || { warn '分流模式需保留至少一个已启用的 HTTPS 网站。'; return 1; }
+  [[ $count -gt 1 ]] || ! stream_has_local_nodes || { warn '同机 REALITY 节点需保留已启用的 HTTPS 回落网站。'; return 1; }
 }
 
 stream_collect_sites() {
@@ -114,9 +119,8 @@ stream_check_layout() {
   if [[ $sockets ]] && printf '%s\n' "$sockets" | grep -v '"nginx"' >/dev/null; then
     warn '443 或 8443 被其他程序占用，停止操作。'; return 1
   fi
-  if ! stream_enabled && [[ $sockets == *:8443* ]]; then
-    warn '8443 已被监听，无法安全迁移。'; return 1
-  fi
+  # A marked local-only fallback may already serve 8443 without Stream.
+  # The parser rejects unowned 8443 listeners and validates the marked sites.
 }
 
 stream_module_available() {
@@ -320,13 +324,24 @@ stream_do_enable() {
 }
 
 stream_confirm_enable() {
-  local path domain=${1:-}
+  local path domain=${1:-} mode=${2:-local}
   log '将迁移以下 npctl HTTPS 站点（包括暂未启用的站点）'
   [[ ${#STREAM_SITES[@]} -gt 0 ]] || echo '  当前没有已有 HTTPS 站点。'
   for path in "${STREAM_SITES[@]}"; do
-    printf '  %s: HTTPS 443 → 127.0.0.1:8443\n' "$path"
+    if grep -Fqx "$STREAM_LOCAL_FALLBACK_MARKER" "$path"; then
+      printf '  %s: 保持本地 HTTPS 127.0.0.1:8443\n' "$path"
+    else
+      printf '  %s: HTTPS 443 → 127.0.0.1:8443\n' "$path"
+    fi
   done
-  [[ ! $domain ]] || echo "将为节点 $domain 复用或创建 HTTPS 回落网站，并添加 SNI 映射。"
+  if [[ $domain ]]; then
+    if [[ $mode == relay ]]; then
+      echo "节点 $domain 使用纯中转：只添加 SNI 映射，不要求本机提供该域名的证书或 HTTPS 回落网站。"
+      echo '没有本地 HTTPS 网站时，未匹配的 SNI 连接将关闭。'
+    else
+      echo "将为节点 $domain 复用或创建 HTTPS 回落网站，并添加 SNI 映射。"
+    fi
+  fi
   echo '公网 IPv4/IPv6 TCP 443 将由 Nginx Stream 独占；80、证书和网站内容保留。'
   warn 'HTTPS 后端将看到本地连接 IP。访问日志、X-Real-IP/X-Forwarded-For、IP ACL、限速及 Fail2Ban 的客户端 IP 识别会受影响；本功能不传送或伪造客户端 IP。'
   prompt_yes_no '确认启用 SNI 分流并执行以上变更' n
@@ -341,9 +356,13 @@ stream_enable() {
     [[ ! -e $NGINX_SITES_ENABLED_DIR/${path##*/} ]] || active=$((active + 1))
   done
   if [[ $active == 0 ]]; then
-    echo '当前没有已启用的 HTTPS 站点，请添加首个节点；对应的 HTTPS 回落网站与 SNI 分流将一起配置。'
-    stream_add_node
-    return $?
+    if [[ -s $NPCTL_STREAM_DIR/nodes.tsv ]] && ! stream_has_local_nodes; then
+      echo '将恢复已保存的纯中转映射；无需创建本机网站或证书，未匹配的 SNI 连接将关闭。'
+    else
+      echo '当前没有已启用的 HTTPS 站点，请添加首个节点；可选择同机 HTTPS 回落或纯中转。'
+      stream_add_node
+      return $?
+    fi
   fi
   stream_confirm_enable || return 0
   stream_ensure_module || return 1
@@ -413,7 +432,7 @@ stream_select_certificate() {
 }
 
 stream_build_fallback() {
-  local domain=$1 certificate=$2 available=$NGINX_SITES_AVAILABLE_DIR/$1
+  local domain=$1 certificate=$2 local_only=${3:-0} available=$NGINX_SITES_AVAILABLE_DIR/$1 listener
   stream_snapshot "$available" || return 1
   stream_snapshot "$NGINX_SITES_ENABLED_DIR/$domain" || return 1
   stream_snapshot "$NPCTL_FALLBACK_ROOT/$domain/index.html" || return 1
@@ -421,17 +440,25 @@ stream_build_fallback() {
   chmod 755 "$NPCTL_FALLBACK_ROOT" "$NPCTL_FALLBACK_ROOT/$domain" || return 1
   printf '<!doctype html><html><head><title>Welcome</title></head><body><h1>Welcome</h1></body></html>\n' >"$NPCTL_FALLBACK_ROOT/$domain/index.html" || return 1
   chmod 644 "$NPCTL_FALLBACK_ROOT/$domain/index.html" || return 1
-  cat >"$available" <<EOF
-$NPCTL_MANAGED_MARKER
-$STREAM_FALLBACK_MARKER
+  listener=$(site_https_listener)
+  {
+    printf '%s\n%s\n' "$NPCTL_MANAGED_MARKER" "$STREAM_FALLBACK_MARKER"
+    if [[ $local_only == 1 ]]; then
+      echo "$STREAM_LOCAL_FALLBACK_MARKER"
+      listener=127.0.0.1:8443
+    else
+      cat <<EOF
 server {
     listen 80;
     server_name $domain;
     include /etc/nginx/snippets/acme-webroot.conf;
     include /etc/nginx/snippets/redirect-https-308.conf;
 }
+EOF
+    fi
+    cat <<EOF
 server {
-    listen $(site_https_listener) ssl http2;
+    listen $listener ssl http2;
     server_name $domain;
     ssl_certificate /etc/letsencrypt/live/$certificate/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$certificate/privkey.pem;
@@ -443,14 +470,18 @@ server {
     location / { try_files \$uri \$uri/ =404; }
 }
 EOF
+  } >"$available" || return 1
   ln -s "$available" "$NGINX_SITES_ENABLED_DIR/$domain"
 }
 
 stream_prepare_website() {
-  local domain=$1 current_cert
+  local domain=$1 local_only=${2:-0} current_cert
   STREAM_WEBSITE=$(stream_find_website "$domain") || return 1
   STREAM_CERTIFICATE=
   if [[ $STREAM_WEBSITE ]]; then
+    if [[ $local_only == 1 ]] && ! grep -Fqx "$STREAM_LOCAL_FALLBACK_MARKER" "$STREAM_WEBSITE"; then
+      warn '已有同域名普通站点，未自动改变其监听；请保留现有站点并先确认其 HTTPS 部署方式。'; return 1
+    fi
     current_cert=$(extract_site_certificate_name_from_config "$STREAM_WEBSITE") || return 1
     if stream_certificate_valid "$domain" "$current_cert"; then
       STREAM_CERTIFICATE=$current_cert
@@ -469,9 +500,9 @@ stream_prepare_website() {
 }
 
 stream_ensure_website() {
-  local domain=$1 temp old
+  local domain=$1 local_only=${2:-0} temp old
   if [[ ! $STREAM_WEBSITE ]]; then
-    stream_build_fallback "$domain" "$STREAM_CERTIFICATE" || return 1
+    stream_build_fallback "$domain" "$STREAM_CERTIFICATE" "$local_only" || return 1
   else
     stream_snapshot "$STREAM_WEBSITE" || return 1
     old=$(extract_site_certificate_name_from_config "$STREAM_WEBSITE") || return 1
@@ -486,6 +517,70 @@ stream_ensure_website() {
       ln -s "$STREAM_WEBSITE" "$NGINX_SITES_ENABLED_DIR/${STREAM_WEBSITE##*/}" || return 1
     fi
   fi
+}
+
+stream_node_mode() {
+  if [[ ! -f $NPCTL_STREAM_DIR/node-modes.tsv ]]; then printf '%s\n' local; return 0; fi
+  awk -F '\t' -v sni="$1" '$1 == sni {mode=$2; count++}
+    END {if (!count) print "local"; else if (count == 1 && (mode == "local" || mode == "relay")) print mode; else exit 1}' \
+    "$NPCTL_STREAM_DIR/node-modes.tsv"
+}
+
+stream_has_local_nodes() {
+  local domain port mode
+  [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] || return 1
+  while IFS=$'\t' read -r domain port; do
+    [[ $domain ]] || continue
+    mode=$(stream_node_mode "$domain") || return 0 # Fail closed for site deletion.
+    [[ $mode != local ]] || return 0
+  done <"$NPCTL_STREAM_DIR/nodes.tsv"
+  return 1
+}
+
+stream_needs_local_fallback() {
+  local mode
+  stream_node_port "$1" >/dev/null || return 1
+  mode=$(stream_node_mode "$1") || return 0
+  [[ $mode == local ]]
+}
+
+stream_set_node_mode() {
+  local domain=$1 mode=$2 temp
+  [[ $mode == local || $mode == relay || $mode == remove ]] || return 1
+  [[ $mode == relay || -f $NPCTL_STREAM_DIR/node-modes.tsv ]] || return 0
+  stream_snapshot "$NPCTL_STREAM_DIR/node-modes.tsv" || return 1
+  temp=$(mktemp) || return 1
+  if [[ -f $NPCTL_STREAM_DIR/node-modes.tsv ]]; then
+    awk -F '\t' -v sni="$domain" '$1 != sni' "$NPCTL_STREAM_DIR/node-modes.tsv" >"$temp" || { rm -f "$temp"; return 1; }
+  fi
+  if [[ $mode == relay ]]; then printf '%s\trelay\n' "$domain" >>"$temp" || { rm -f "$temp"; return 1; }; fi
+  cat "$temp" >"$NPCTL_STREAM_DIR/node-modes.tsv" || { rm -f "$temp"; return 1; }
+  rm -f "$temp"
+}
+
+stream_select_node_mode() {
+  local selection default=${1:-local} number=1
+  [[ $default != relay ]] || number=2
+  echo '节点部署方式: 1. 同机 REALITY + 本机 HTTPS 回落  2. 纯中转（REALITY 和 HTTPS 回落在落地机）'
+  read -r -p "请选择 [$number]: " selection || return 1
+  case ${selection:-$number} in
+    1) STREAM_NODE_MODE=local ;;
+    2) STREAM_NODE_MODE=relay ;;
+    *) warn '无效的节点部署方式。'; return 1 ;;
+  esac
+}
+
+stream_node_instructions() {
+  local domain=$1 mode=$2
+  echo "客户端: server=$domain, port=443, servername=$domain"
+  if [[ $mode == relay ]]; then
+    echo '纯中转：本机只透传 TCP，请保留 direct 到落地机 VLESS 的转发规则。'
+    echo 'REALITY handshake 应由落地机设置；仅当 HTTPS 回落也在落地机时，才使用落地机的 127.0.0.1:8443。'
+    echo '本机 8443 不会供远程落地机访问；不要将 handshake 指向会转回 REALITY 的公网节点 443。'
+  else
+    echo 'REALITY 与 HTTPS 回落在本机时，请在 sing-box 管理脚本中自行设置 handshake: 127.0.0.1:8443。'
+  fi
+  echo '域名需解析到本机；Cloudflare 应使用仅 DNS（灰云），本工具不修改 DNS。'
 }
 
 stream_validate_node() {
@@ -503,52 +598,61 @@ stream_validate_node() {
 }
 
 stream_do_add_node() {
-  local domain=$1 port=$2 enable_requested=${3:-0}
+  local domain=$1 port=$2 enable_requested=${3:-0} mode=${4:-local}
+  [[ $mode == local || $mode == relay ]] || return 1
   stream_validate_node "$domain" "$port" || return 1
   if ! stream_enabled; then
     [[ $enable_requested == 1 ]] || { warn 'SNI 状态已变化，请重新添加节点并确认启用。'; return 1; }
     stream_check_layout || return 1
   fi
-  stream_certificate_valid "$domain" "$STREAM_CERTIFICATE" || {
-    warn '节点证书已失效或未覆盖 SNI，未添加映射。'; return 1;
-  }
-  stream_ensure_website "$domain" || return 1
+  if [[ $mode == local ]]; then
+    stream_certificate_valid "$domain" "$STREAM_CERTIFICATE" || {
+      warn '节点证书已失效或未覆盖 SNI，未添加映射。'; return 1;
+    }
+    stream_ensure_website "$domain" || return 1
+  fi
   # Keep site creation, listener migration and the first mapping in one
   # transaction. No intermediate configuration is reloaded.
   if ! stream_enabled; then stream_do_enable || return 1; fi
   stream_snapshot "$NPCTL_STREAM_DIR/nodes.tsv" || return 1
   printf '%s\t%s\n' "$domain" "$port" >>"$NPCTL_STREAM_DIR/nodes.tsv" || return 1
+  stream_set_node_mode "$domain" "$mode" || return 1
   stream_write_config
 }
 
 stream_add_node() {
-  local domain port enable_requested=0
+  local domain port enable_requested=0 mode
   stream_require || return 1
   read -r -p '节点 SNI 域名（留空取消）: ' domain || return 1
   [[ $domain ]] || { echo '已取消添加节点。'; return 0; }
   domain=${domain,,}
   read -r -p '节点本地监听端口: ' port || return 1
   stream_validate_node "$domain" "$port" || return 1
+  stream_select_node_mode || return 1
+  mode=$STREAM_NODE_MODE
   stream_check_layout || return 1
   if ! stream_enabled; then
-    stream_confirm_enable "$domain" || return 0
+    stream_confirm_enable "$domain" "$mode" || return 0
     stream_ensure_module || return 1
     enable_requested=1
   fi
-  stream_prepare_website "$domain" || return 1
-  stream_transaction stream_do_add_node "$domain" "$port" "$enable_requested" || return 1
-  echo "客户端: server=$domain, port=443, servername=$domain"
-  echo '请在 sing-box 管理脚本中自行设置 REALITY handshake: 127.0.0.1:8443。'
-  echo '域名需解析到本机；Cloudflare 应使用仅 DNS（灰云），本工具不修改 DNS。'
+  if [[ $mode == local ]]; then stream_prepare_website "$domain" || return 1; fi
+  stream_transaction stream_do_add_node "$domain" "$port" "$enable_requested" "$mode" || return 1
+  stream_node_instructions "$domain" "$mode"
 }
 
 stream_show_nodes() {
-  local domain port site certificate valid website
+  local domain port mode site certificate valid website
   if stream_enabled; then echo 'SNI 分流: 已启用'; else echo 'SNI 分流: 已禁用（保留映射）'; fi
-  echo '默认目标: Nginx 本地 HTTPS 127.0.0.1:8443'
+  echo '未匹配 SNI 的默认目标: 本机 HTTPS 127.0.0.1:8443；没有本地 HTTPS 网站时连接关闭。'
   [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] || return 0
   while IFS=$'\t' read -r domain port; do
     [[ $domain ]] || continue
+    mode=$(stream_node_mode "$domain") || { warn "节点部署方式元数据无效: $domain"; return 1; }
+    if [[ $mode == relay ]]; then
+      printf '%s → 127.0.0.1:%s | 纯中转 | 本机无需该域名证书；HTTPS 回落由落地机提供\n' "$domain" "$port"
+      continue
+    fi
     site=$(stream_find_website "$domain") || return 1
     certificate=无; valid=无有效证书; website=无
     if [[ $site ]]; then
@@ -557,7 +661,7 @@ stream_show_nodes() {
       [[ ! -e $NGINX_SITES_ENABLED_DIR/${site##*/} ]] || website=存在且已启用
       stream_certificate_valid "$domain" "$certificate" && valid=有效且覆盖SNI
     fi
-    printf '%s → 127.0.0.1:%s | 证书 %s (%s) | 回落网站 %s\n' "$domain" "$port" "$certificate" "$valid" "$website"
+    printf '%s → 127.0.0.1:%s | 同机回落 | 证书 %s (%s) | 回落网站 %s\n' "$domain" "$port" "$certificate" "$valid" "$website"
   done <"$NPCTL_STREAM_DIR/nodes.tsv"
 }
 
@@ -596,10 +700,43 @@ stream_change_node_port() {
   [[ $port != "$current_port" ]] || { echo '端口未变化，无需修改。'; return 0; }
   stream_check_layout || return 1
   echo "$domain: 127.0.0.1:$current_port → 127.0.0.1:$port"
-  echo '此处只修改 Nginx 转发目标，请确保对应 sing-box 节点已监听新端口。'
+  echo '此处只修改 Nginx 转发目标，请确保本机对应的 REALITY 或 direct 中转入口已监听新端口。'
   prompt_yes_no '确认修改此节点后端端口' n || return 0
   stream_transaction stream_do_change_node_port "$domain" "$port" "$current_port" || return 1
   echo "已更新节点后端: $domain → 127.0.0.1:$port"
+}
+
+stream_do_change_node_mode() {
+  local domain=$1 mode=$2 expected_mode=$3 current_mode
+  stream_node_port "$domain" >/dev/null || return 1
+  current_mode=$(stream_node_mode "$domain") || return 1
+  [[ $current_mode == "$expected_mode" ]] || { warn '节点部署方式已变化，请重新选择。'; return 1; }
+  [[ $mode == local || $mode == relay ]] || return 1
+  if [[ $mode == local ]]; then
+    stream_certificate_valid "$domain" "$STREAM_CERTIFICATE" || { warn '本机回落证书无效。'; return 1; }
+    stream_ensure_website "$domain" || return 1
+  fi
+  stream_set_node_mode "$domain" "$mode"
+}
+
+stream_change_node_mode() {
+  local domain mode current_mode
+  stream_require || return 1
+  stream_show_nodes || return 1
+  read -r -p '要修改部署方式的节点 SNI（留空取消）: ' domain || return 1
+  [[ $domain ]] || return 0
+  domain=${domain,,}
+  validate_domain "$domain" && stream_node_port "$domain" >/dev/null || { warn '未找到此节点。'; return 1; }
+  current_mode=$(stream_node_mode "$domain") || return 1
+  stream_select_node_mode "$current_mode" || return 1
+  mode=$STREAM_NODE_MODE
+  [[ $mode != "$current_mode" ]] || { echo '部署方式未变化。'; return 0; }
+  stream_check_layout || return 1
+  echo '将保留现有 SNI、后端端口、网站和证书；仅同机回落模式需要准备本机 HTTPS 网站。'
+  prompt_yes_no '确认修改节点部署方式' n || return 0
+  if [[ $mode == local ]]; then stream_prepare_website "$domain" || return 1; fi
+  stream_transaction stream_do_change_node_mode "$domain" "$mode" "$current_mode" || return 1
+  stream_node_instructions "$domain" "$mode"
 }
 
 stream_do_delete_node() {
@@ -609,6 +746,7 @@ stream_do_delete_node() {
   awk -F '\t' -v domain="$domain" '$1 != domain' "$NPCTL_STREAM_DIR/nodes.tsv" >"$temp" || { rm -f "$temp"; return 1; }
   cat "$temp" >"$NPCTL_STREAM_DIR/nodes.tsv" || { rm -f "$temp"; return 1; }
   rm -f "$temp"
+  stream_set_node_mode "$domain" remove || return 1
   if stream_enabled; then stream_write_config; fi
 }
 
@@ -626,14 +764,36 @@ stream_delete_node() {
   echo '已删除映射；网站和证书继续保留。'
 }
 
+stream_check_local_https_port() {
+  local sockets
+  sockets=$(ss -H -ltnp '( sport = :8443 )') || return 1
+  if [[ $sockets ]] && printf '%s\n' "$sockets" | grep -v '"nginx"' >/dev/null; then
+    warn '本地 HTTPS 8443 被其他进程占用，未创建回落网站。'; return 1
+  fi
+}
+
+stream_do_create_fallback() {
+  local domain=$1 local_only=${2:-0}
+  if [[ $local_only == 1 ]]; then stream_check_local_https_port || return 1; fi
+  stream_ensure_website "$domain" "$local_only"
+}
+
 stream_create_fallback() {
-  local domain
+  local domain local_only=${1:-0}
   stream_require && check_site_template_environment || return 1
+  if [[ $local_only == 1 ]]; then
+    stream_check_local_https_port || return 1
+    echo '在运行 REALITY 的落地机创建 127.0.0.1:8443 HTTPS；不启用 Stream，不占用公网 80/443。'
+    echo '域名指向线路机时，请使用已有有效证书或 Cloudflare DNS 验证；直接在落地机进行 HTTP 验证通常不可达。'
+  fi
   read -r -p 'HTTPS 回落网站域名: ' domain
   domain=${domain,,}
   validate_domain "$domain" || { warn '域名无效。'; return 1; }
-  stream_prepare_website "$domain" || return 1
-  stream_transaction stream_ensure_website "$domain"
+  stream_prepare_website "$domain" "$local_only" || return 1
+  stream_transaction stream_do_create_fallback "$domain" "$local_only" || return 1
+  if [[ $local_only == 1 ]]; then
+    echo "本地 HTTPS 回落已准备: 127.0.0.1:8443，SNI=$domain；无需开放公网 8443。"
+  fi
 }
 
 stream_do_delete_fallback() {
@@ -654,29 +814,36 @@ stream_delete_fallback() {
   [[ -f $site ]] && grep -Fqx "$STREAM_FALLBACK_MARKER" "$site" || {
     warn '仅能删除本功能创建的静态回落网站；普通反代站点请使用站点管理。'; return 1;
   }
-  if [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] && awk -F '\t' -v domain="$domain" '$1 == domain {found=1} END {exit !found}' "$NPCTL_STREAM_DIR/nodes.tsv"; then
-    warn '此网站仍被节点使用，请先删除映射。'; return 1
+  if stream_needs_local_fallback "$domain"; then
+    warn '此网站仍被同机节点使用，请先删除映射或将节点切换为纯中转。'; return 1
   fi
   if stream_enabled; then
     stream_collect_sites || return 1
     for path in "${STREAM_SITES[@]}"; do [[ ! -e $NGINX_SITES_ENABLED_DIR/${path##*/} ]] || count=$((count + 1)); done
-    [[ $count -gt 1 || ! -e $NGINX_SITES_ENABLED_DIR/$domain ]] || { warn '不能删除分流模式下最后一个已启用 HTTPS 网站。'; return 1; }
+    [[ $count -gt 1 || ! -e $NGINX_SITES_ENABLED_DIR/$domain ]] || ! stream_has_local_nodes || {
+      warn '不能删除同机回落模式下最后一个已启用 HTTPS 网站。'; return 1;
+    }
   fi
   prompt_yes_no '确认删除该静态回落网站（保留证书）' n || return 0
   stream_transaction stream_do_delete_fallback "$domain"
 }
 
 stream_manage_fallbacks() {
-  local selection path
+  local selection path listener
   while true; do
-    echo 'HTTPS 回落网站: 1. 查看  2. 创建/复用  3. 删除静态回落网站  q. 返回'
+    echo 'HTTPS 回落网站: 1. 查看  2. 创建/复用  3. 删除静态回落网站  4. 创建落地机本地 HTTPS 8443（不启用 SNI）  q. 返回'
     read -r -p '请选择: ' selection
     case $selection in
       1)
         stream_collect_sites || return 1
-        for path in "${STREAM_SITES[@]}"; do printf '%s | 证书 %s\n' "$(extract_unique_site_domain_from_config "$path")" "$(extract_site_certificate_name_from_config "$path")"; done ;;
+        for path in "${STREAM_SITES[@]}"; do
+          listener=$(site_https_listener)
+          if grep -Fqx "$STREAM_LOCAL_FALLBACK_MARKER" "$path"; then listener='127.0.0.1:8443（本地专用）'; fi
+          printf '%s | HTTPS %s | 证书 %s\n' "$(extract_unique_site_domain_from_config "$path")" "$listener" "$(extract_site_certificate_name_from_config "$path")"
+        done ;;
       2) stream_create_fallback ;;
       3) stream_delete_fallback ;;
+      4) stream_create_fallback 1 ;;
       q|Q) return 0 ;;
       *) warn '无效选项。' ;;
     esac
@@ -686,7 +853,7 @@ stream_manage_fallbacks() {
 manage_stream() {
   local selection
   while true; do
-    echo 'SNI 分流管理: 1. 启用  2. 添加节点  3. 查看映射  4. 删除节点  5. HTTPS 回落网站  6. 禁用  7. 修改节点后端端口  q. 返回'
+    echo 'SNI 分流管理: 1. 启用  2. 添加节点  3. 查看映射  4. 删除节点  5. HTTPS 回落网站  6. 禁用  7. 修改节点后端端口  8. 修改节点部署方式  q. 返回'
     read -r -p '请选择: ' selection
     case $selection in
       1) stream_enable ;;
@@ -696,6 +863,7 @@ manage_stream() {
       5) stream_manage_fallbacks ;;
       6) stream_disable ;;
       7) stream_change_node_port ;;
+      8) stream_change_node_mode ;;
       q|Q) return 0 ;;
       *) warn '无效选项。' ;;
     esac
