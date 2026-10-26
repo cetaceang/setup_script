@@ -262,6 +262,96 @@ ln -s "$NGINX_SITES_AVAILABLE_DIR/{domain}" "$NGINX_SITES_ENABLED_DIR/{domain}"
                              ('node2.example.com', '000443'), ('node2.example.com', '999999999999999999')]:
             self.run_bash(f'stream_validate_node "{domain}" "{port}"', success=False)
 
+    def test_edit_node_port_preserves_sites_certificates_and_other_mappings(self):
+        self.enable()
+        self.add('node1.example.com', 39149)
+        self.add('node2.example.com', 39150)
+        unchanged = {p: p.read_bytes() for p in [*self.available.iterdir(),
+                    *self.cert.glob('live/*/*'), *self.root.glob('web/*/index.html')]}
+        result = self.run_bash('manage_stream', input='7\nnode1.example.com\n34138\ny\nq\n')
+        self.assertIn('已更新节点后端', result.stdout)
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(),
+                         'node1.example.com\t34138\nnode2.example.com\t39150\n')
+        content = (self.stream / 'stream.conf').read_text()
+        self.assertIn('server 127.0.0.1:34138;', content)
+        self.assertIn('server 127.0.0.1:39150;', content)
+        self.assertNotIn('server 127.0.0.1:39149;', content)
+        for path, data in unchanged.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_edit_node_port_rejects_invalid_reserved_and_duplicate_ports(self):
+        self.enable()
+        self.add('node1.example.com', 39149)
+        self.add('node2.example.com', 34138)
+        before = {p: p.read_bytes() for p in self.stream.iterdir()}
+        for port in ('0', '65536', '0080', '80', '443', '8443', '34138', 'not-a-port'):
+            with self.subTest(port=port):
+                self.run_bash('stream_change_node_port', input=f'node1.example.com\n{port}\n', success=False)
+                for path, data in before.items():
+                    self.assertEqual(path.read_bytes(), data)
+
+    def test_edit_node_port_uses_each_user_supplied_port(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        for port in ('12001', '52347', '65535'):
+            with self.subTest(port=port):
+                self.run_bash('stream_change_node_port', input=f'node.example.com\n{port}\ny\n')
+                self.assertEqual((self.stream / 'nodes.tsv').read_text(), f'node.example.com\t{port}\n')
+                self.assertIn(f'server 127.0.0.1:{port};', (self.stream / 'stream.conf').read_text())
+
+    def test_edit_node_port_noop_and_cancel_do_not_reload(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        before = {p: p.read_bytes() for p in self.stream.iterdir()}
+        calls = (self.root / 'systemctl.log').read_text().count('reload nginx')
+        for answer in ('\n', 'node.example.com\n\n', 'node.example.com\n34138\nn\n'):
+            self.run_bash('stream_change_node_port', input=answer)
+        for path, data in before.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.assertEqual((self.root / 'systemctl.log').read_text().count('reload nginx'), calls)
+
+    def test_edit_node_port_rolls_back_failed_check_or_reload(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        nginx_stub = (self.bin / 'nginx').read_text()
+        old_failure = 'if [[ -f $FIXTURE/fail_check && -f $FIXTURE/nginx/npctl-stream/enabled ]]; then exit 1; fi'
+        self.assertIn(old_failure, nginx_stub)
+        self.stub('nginx', nginx_stub.replace(old_failure,
+                  'if [[ -f $FIXTURE/fail_check ]] && grep -Fq "server 127.0.0.1:34138;" "$FIXTURE/nginx/npctl-stream/stream.conf"; then exit 1; fi'))
+        before = {p: p.read_bytes() for p in self.stream.iterdir()}
+        for marker in ('fail_check', 'fail_reload'):
+            with self.subTest(marker=marker):
+                backups = len(list((self.root / 'backups').iterdir()))
+                (self.root / marker).touch()
+                self.run_bash('stream_change_node_port', input='node.example.com\n34138\ny\n', success=False)
+                self.assertEqual(len(list((self.root / 'backups').iterdir())), backups + 1)
+                for path, data in before.items():
+                    self.assertEqual(path.read_bytes(), data)
+                self.assertFalse((self.root / 'lock').exists())
+                (self.root / marker).unlink(missing_ok=True)
+
+    def test_edit_stored_node_port_does_not_enable_disabled_stream(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        self.run_bash('stream_transaction stream_do_disable')
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        site = (self.available / 'node.example.com').read_bytes()
+        self.run_bash('stream_change_node_port', input='node.example.com\n34138\ny\n')
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(), 'node.example.com\t34138\n')
+        self.assertFalse((self.stream / 'enabled').exists())
+        self.assertFalse((self.stream / 'stream.conf').exists())
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), original)
+        self.assertEqual((self.available / 'node.example.com').read_bytes(), site)
+
+    def test_edit_node_port_rejects_missing_or_concurrently_changed_mapping(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        before = {p: p.read_bytes() for p in self.stream.iterdir()}
+        self.run_bash('stream_change_node_port', input='missing.example.com\n', success=False)
+        self.run_bash('stream_transaction stream_do_change_node_port node.example.com 34138 39148', success=False)
+        for path, data in before.items():
+            self.assertEqual(path.read_bytes(), data)
+
     def test_new_ordinary_site_and_body_size_certificate_management(self):
         self.enable()
         self.create_site('new.example.com')
@@ -432,6 +522,18 @@ if [[ $1 == -s ]]; then echo 'Inst libnginx-mod-stream (test)'; exit 0; fi
         self.enable()
         self.add('node1.example.com', 34138)
         self.add('node2.example.com', 39149)
+        self.run_live_smoke()
+
+    @unittest.skipUnless(os.environ.get('NPCTL_TEST_NETNS') == '1' and os.environ.get('NPCTL_TEST_NGINX'),
+                         'requires unpacked nginx and sudo unshare -n')
+    def test_live_edited_node_port_routes_to_new_backend(self):
+        self.enable()
+        self.add('node1.example.com', 49149)
+        self.add('node2.example.com', 39149)
+        self.run_bash('stream_change_node_port', input='node1.example.com\n34138\ny\n')
+        self.run_live_smoke()
+
+    def run_live_smoke(self):
         (self.root / 'acme/.well-known/acme-challenge').mkdir(parents=True)
         result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'python3', str(REPO / 'tests/live_stream_smoke.py'),
                                  str(self.root), self.env['NPCTL_TEST_NGINX']], capture_output=True, text=True, timeout=20)

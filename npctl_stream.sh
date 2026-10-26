@@ -489,12 +489,13 @@ stream_ensure_website() {
 }
 
 stream_validate_node() {
-  local domain=$1 port=$2 existing_domain existing_port
+  local domain=$1 port=$2 replacing_domain=${3:-} existing_domain existing_port
   validate_domain "$domain" && validate_port "$port" && [[ $port != 443 && $port != 8443 && $port != 80 ]] || {
     warn '节点需使用有效 SNI 域名与 1–65535 本地端口，不能使用 80、443 或 8443。'; return 1;
   }
   [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] || return 0
   while IFS=$'\t' read -r existing_domain existing_port; do
+    [[ ! $replacing_domain || $existing_domain != "$replacing_domain" ]] || continue
     if [[ $domain == "$existing_domain" || $port == "$existing_port" ]]; then
       warn 'SNI 或节点本地端口已被其他映射使用。'; return 1
     fi
@@ -558,6 +559,47 @@ stream_show_nodes() {
     fi
     printf '%s → 127.0.0.1:%s | 证书 %s (%s) | 回落网站 %s\n' "$domain" "$port" "$certificate" "$valid" "$website"
   done <"$NPCTL_STREAM_DIR/nodes.tsv"
+}
+
+stream_node_port() {
+  [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] || return 1
+  awk -F '\t' -v sni="$1" '$1 == sni {port=$2; count++} END {if (count == 1) print port; else exit 1}' "$NPCTL_STREAM_DIR/nodes.tsv"
+}
+
+stream_do_change_node_port() {
+  local domain=$1 port=$2 expected_port=$3 current_port temp
+  current_port=$(stream_node_port "$domain") || { warn '未找到唯一的节点映射。'; return 1; }
+  [[ $current_port == "$expected_port" ]] || { warn '节点端口已被其他操作修改，请重新选择。'; return 1; }
+  stream_validate_node "$domain" "$port" "$domain" || return 1
+  stream_snapshot "$NPCTL_STREAM_DIR/nodes.tsv" || return 1
+  temp=$(mktemp) || return 1
+  awk -F '\t' -v sni="$domain" -v target_port="$port" 'BEGIN {OFS="\t"} $1 == sni {$2=target_port} {print}' \
+    "$NPCTL_STREAM_DIR/nodes.tsv" >"$temp" || { rm -f "$temp"; return 1; }
+  cat "$temp" >"$NPCTL_STREAM_DIR/nodes.tsv" || { rm -f "$temp"; return 1; }
+  rm -f "$temp"
+  if stream_enabled; then stream_write_config || return 1; fi
+}
+
+stream_change_node_port() {
+  local domain port current_port
+  stream_require || return 1
+  [[ -s $NPCTL_STREAM_DIR/nodes.tsv ]] || { warn '暂无可修改的 SNI 节点映射。'; return 1; }
+  stream_show_nodes || return 1
+  read -r -p '要修改的节点 SNI（留空取消）: ' domain || return 1
+  [[ $domain ]] || { echo '已取消修改。'; return 0; }
+  domain=${domain,,}
+  validate_domain "$domain" || { warn 'SNI 域名无效。'; return 1; }
+  current_port=$(stream_node_port "$domain") || { warn '未找到唯一的节点映射。'; return 1; }
+  read -r -p "新后端端口 [$current_port]: " port || return 1
+  port=${port:-$current_port}
+  stream_validate_node "$domain" "$port" "$domain" || return 1
+  [[ $port != "$current_port" ]] || { echo '端口未变化，无需修改。'; return 0; }
+  stream_check_layout || return 1
+  echo "$domain: 127.0.0.1:$current_port → 127.0.0.1:$port"
+  echo '此处只修改 Nginx 转发目标，请确保对应 sing-box 节点已监听新端口。'
+  prompt_yes_no '确认修改此节点后端端口' n || return 0
+  stream_transaction stream_do_change_node_port "$domain" "$port" "$current_port" || return 1
+  echo "已更新节点后端: $domain → 127.0.0.1:$port"
 }
 
 stream_do_delete_node() {
@@ -644,7 +686,7 @@ stream_manage_fallbacks() {
 manage_stream() {
   local selection
   while true; do
-    echo 'SNI 分流管理: 1. 启用  2. 添加节点  3. 查看映射  4. 删除节点  5. HTTPS 回落网站  6. 禁用  q. 返回'
+    echo 'SNI 分流管理: 1. 启用  2. 添加节点  3. 查看映射  4. 删除节点  5. HTTPS 回落网站  6. 禁用  7. 修改节点后端端口  q. 返回'
     read -r -p '请选择: ' selection
     case $selection in
       1) stream_enable ;;
@@ -653,6 +695,7 @@ manage_stream() {
       4) stream_delete_node ;;
       5) stream_manage_fallbacks ;;
       6) stream_disable ;;
+      7) stream_change_node_port ;;
       q|Q) return 0 ;;
       *) warn '无效选项。' ;;
     esac
