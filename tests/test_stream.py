@@ -49,6 +49,8 @@ class StreamTests(unittest.TestCase):
         self.env['PATH'] = str(self.bin) + ':' + self.env['PATH']
         self.env['FIXTURE'] = str(self.root)
         self.env['MAIN'] = str(self.nginx / 'nginx.conf')
+        if self.env.get('NPCTL_TEST_AWK'):
+            self.stub('awk', '#!/bin/bash\nexec "$NPCTL_TEST_AWK" "$@"\n')
         self.stub('systemctl', '''#!/bin/bash
 printf '%s\\n' "$*" >> "$FIXTURE/systemctl.log"
 if [[ $1 == show ]]; then
@@ -205,6 +207,21 @@ rewrite_site_certificate_config "$site" example.com other.example.com "$site.cer
                         '-signkey', str(expired / 'privkey.pem'), '-days', '0', '-out', str(expired / 'fullchain.pem')],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.run_bash('stream_certificate_valid node.example.com expired.example.com', success=False)
+
+    def test_old_openssl_zero_exit_on_hostname_mismatch_is_rejected(self):
+        # OpenSSL 1.1.1/3.0 print a mismatch while returning success. Newer
+        # OpenSSL returns failure; test the older real CLI behavior explicitly.
+        self.stub('openssl', '''#!/bin/bash
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == -checkhost ]]; then
+    printf 'Hostname %s does NOT match certificate\\n' "$2"
+    exit 0
+  fi
+  shift
+done
+exit 0
+''')
+        self.run_bash('stream_certificate_valid unrelated.example.net example.com', success=False)
 
     def test_existing_website_is_reused(self):
         self.enable()

@@ -5,9 +5,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        awk: [mawk, gawk]
+    env:
+      NPCTL_TEST_AWK: ${{ matrix.awk }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck openssl
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck openssl mawk gawk
       - run: for script in setup.sh nginx_proxy_control.sh npctl_stream.sh; do bash -n "$script" || exit 1; done
       - run: shellcheck --severity=warning --extended-analysis=false setup.sh nginx_proxy_control.sh npctl_stream.sh
       - run: python3 -m unittest discover -s tests -v

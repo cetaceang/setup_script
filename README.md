@@ -79,7 +79,9 @@ shellcheck --severity=warning --extended-analysis=false setup.sh nginx_proxy_con
 python3 -m unittest discover -s tests -v
 ```
 
-测试在临时目录生成网站、映射和证书，模拟服务操作、端口与 Certbot，覆盖多站迁移、证书/SNI、映射生命周期、普通网站管理、幂等、setup 保留及失败回滚。也可指定独立解包且 ABI 匹配的 Nginx/Stream 模块执行真实 `nginx -t/-T`；设置 `NPCTL_TEST_NETNS=1` 将校验放在独立网络命名空间中，需本机可无交互使用 `sudo unshare -n`：
+测试在临时目录生成网站、映射和证书，模拟服务操作、端口与 Certbot，覆盖多站迁移、证书/SNI、映射生命周期、普通网站管理、幂等、setup 保留及失败回滚。CI 分别用 mawk、GNU awk 执行全部回归；本机可设置 `NPCTL_TEST_AWK=mawk` 或 `NPCTL_TEST_AWK=gawk`（也支持可执行文件绝对路径）选择 awk 实现。证书测试还覆盖旧 OpenSSL 在域名不匹配时仍返回成功退出码的行为。
+
+也可指定独立解包且 ABI 匹配的 Nginx/Stream 模块执行真实 `nginx -t/-T`；设置 `NPCTL_TEST_NETNS=1` 将校验放在独立网络命名空间中，需本机可无交互使用 `sudo unshare -n`：
 
 ```bash
 NPCTL_TEST_NETNS=1 \

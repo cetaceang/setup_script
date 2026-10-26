@@ -344,7 +344,7 @@ stream_do_disable() {
   stream_snapshot "$NPCTL_STREAM_DIR/stream.conf" || return 1
   stream_migrate disable || return 1
   temp=$(mktemp) || return 1
-  awk -v include="$STREAM_INCLUDE" '$0 != include' "$NGINX_MAIN_CONFIG" >"$temp" || { rm -f "$temp"; return 1; }
+  awk -v npctl_include_line="$STREAM_INCLUDE" '$0 != npctl_include_line' "$NGINX_MAIN_CONFIG" >"$temp" || { rm -f "$temp"; return 1; }
   cat "$temp" >"$NGINX_MAIN_CONFIG" || { rm -f "$temp"; return 1; }
   rm -f "$temp" "$NPCTL_STREAM_DIR/enabled" "$NPCTL_STREAM_DIR/stream.conf"
 }
@@ -374,7 +374,9 @@ stream_certificate_valid() {
   local domain=$1 name=$2 cert=$LETSENCRYPT_DIR/live/$2/fullchain.pem
   [[ $name && -f $cert && -f $LETSENCRYPT_DIR/live/$name/privkey.pem ]] &&
     openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 &&
-    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1
+    # OpenSSL 1.1.1/3.0 may exit zero even when -checkhost does not match.
+    LC_ALL=C openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null |
+      grep -Fqx "Hostname $domain does match certificate"
 }
 
 stream_select_certificate() {
