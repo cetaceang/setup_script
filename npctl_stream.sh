@@ -319,20 +319,33 @@ stream_do_enable() {
   printf '# Managed by npctl SNI\n' >"$NPCTL_STREAM_DIR/enabled"
 }
 
+stream_confirm_enable() {
+  local path domain=${1:-}
+  log '将迁移以下 npctl HTTPS 站点（包括暂未启用的站点）'
+  [[ ${#STREAM_SITES[@]} -gt 0 ]] || echo '  当前没有已有 HTTPS 站点。'
+  for path in "${STREAM_SITES[@]}"; do
+    printf '  %s: HTTPS 443 → 127.0.0.1:8443\n' "$path"
+  done
+  [[ ! $domain ]] || echo "将为节点 $domain 复用或创建 HTTPS 回落网站，并添加 SNI 映射。"
+  echo '公网 IPv4/IPv6 TCP 443 将由 Nginx Stream 独占；80、证书和网站内容保留。'
+  warn 'HTTPS 后端将看到本地连接 IP。访问日志、X-Real-IP/X-Forwarded-For、IP ACL、限速及 Fail2Ban 的客户端 IP 识别会受影响；本功能不传送或伪造客户端 IP。'
+  prompt_yes_no '确认启用 SNI 分流并执行以上变更' n
+}
+
 stream_enable() {
   local path active=0
   stream_require || return 1
   if stream_enabled; then echo 'SNI 分流已启用，未重复迁移。'; return 0; fi
   stream_check_layout || return 1
-  log '将迁移以下 npctl HTTPS 站点（包括暂未启用的站点）'
   for path in "${STREAM_SITES[@]}"; do
-    printf '  %s: HTTPS 443 → 127.0.0.1:8443\n' "$path"
     [[ ! -e $NGINX_SITES_ENABLED_DIR/${path##*/} ]] || active=$((active + 1))
   done
-  [[ $active -gt 0 ]] || { warn '请先创建并启用至少一个普通站点或 HTTPS 回落网站。'; return 1; }
-  echo '公网 IPv4/IPv6 TCP 443 将由 Nginx Stream 独占；80、证书和网站内容保留。'
-  warn 'HTTPS 后端将看到本地连接 IP。访问日志、X-Real-IP/X-Forwarded-For、IP ACL、限速及 Fail2Ban 的客户端 IP 识别会受影响；本功能不传送或伪造客户端 IP。'
-  prompt_yes_no '确认启用 SNI 分流并迁移这些网站' n || return 0
+  if [[ $active == 0 ]]; then
+    echo '当前没有已启用的 HTTPS 站点，请添加首个节点；对应的 HTTPS 回落网站与 SNI 分流将一起配置。'
+    stream_add_node
+    return $?
+  fi
+  stream_confirm_enable || return 0
   stream_ensure_module || return 1
   stream_transaction stream_do_enable
 }
@@ -489,25 +502,40 @@ stream_validate_node() {
 }
 
 stream_do_add_node() {
-  local domain=$1 port=$2
-  stream_enabled && stream_validate_node "$domain" "$port" || return 1
+  local domain=$1 port=$2 enable_requested=${3:-0}
+  stream_validate_node "$domain" "$port" || return 1
+  if ! stream_enabled; then
+    [[ $enable_requested == 1 ]] || { warn 'SNI 状态已变化，请重新添加节点并确认启用。'; return 1; }
+    stream_check_layout || return 1
+  fi
+  stream_certificate_valid "$domain" "$STREAM_CERTIFICATE" || {
+    warn '节点证书已失效或未覆盖 SNI，未添加映射。'; return 1;
+  }
   stream_ensure_website "$domain" || return 1
+  # Keep site creation, listener migration and the first mapping in one
+  # transaction. No intermediate configuration is reloaded.
+  if ! stream_enabled; then stream_do_enable || return 1; fi
   stream_snapshot "$NPCTL_STREAM_DIR/nodes.tsv" || return 1
   printf '%s\t%s\n' "$domain" "$port" >>"$NPCTL_STREAM_DIR/nodes.tsv" || return 1
   stream_write_config
 }
 
 stream_add_node() {
-  local domain port
+  local domain port enable_requested=0
   stream_require || return 1
-  stream_enabled || { warn '请先启用 SNI 分流。'; return 1; }
-  read -r -p '节点 SNI 域名: ' domain
+  read -r -p '节点 SNI 域名（留空取消）: ' domain || return 1
+  [[ $domain ]] || { echo '已取消添加节点。'; return 0; }
   domain=${domain,,}
-  read -r -p '节点本地监听端口: ' port
+  read -r -p '节点本地监听端口: ' port || return 1
   stream_validate_node "$domain" "$port" || return 1
   stream_check_layout || return 1
+  if ! stream_enabled; then
+    stream_confirm_enable "$domain" || return 0
+    stream_ensure_module || return 1
+    enable_requested=1
+  fi
   stream_prepare_website "$domain" || return 1
-  stream_transaction stream_do_add_node "$domain" "$port" || return 1
+  stream_transaction stream_do_add_node "$domain" "$port" "$enable_requested" || return 1
   echo "客户端: server=$domain, port=443, servername=$domain"
   echo '请在 sing-box 管理脚本中自行设置 REALITY handshake: 127.0.0.1:8443。'
   echo '域名需解析到本机；Cloudflare 应使用仅 DNS（灰云），本工具不修改 DNS。'

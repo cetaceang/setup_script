@@ -150,6 +150,85 @@ ln -s "$NGINX_SITES_AVAILABLE_DIR/{domain}" "$NGINX_SITES_ENABLED_DIR/{domain}"
     def add(self, domain, port):
         self.run_bash(f'stream_prepare_website {domain} && stream_transaction stream_do_add_node {domain} {port}', input='y\n')
 
+    def remove_all_sites(self):
+        for directory in (self.enabled, self.available):
+            for file in directory.iterdir():
+                file.unlink()
+
+    def assert_no_first_node_state(self, original_main):
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), original_main)
+        self.assertFalse(list(self.available.iterdir()))
+        self.assertFalse(list(self.enabled.iterdir()))
+        self.assertFalse(list(self.stream.iterdir()))
+        self.assertFalse((self.root / 'web/node.example.com/index.html').exists())
+        self.assertFalse((self.root / 'lock').exists())
+
+    def test_first_node_without_existing_sites_enables_in_one_transaction(self):
+        self.remove_all_sites()
+        result = self.run_bash('stream_add_node', input='node.example.com\n39149\ny\ny\n')
+        self.assertIn('当前没有已有 HTTPS 站点', result.stdout)
+        self.assertTrue((self.stream / 'enabled').exists())
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(), 'node.example.com\t39149\n')
+        site = (self.available / 'node.example.com').read_text()
+        self.assertIn('listen 127.0.0.1:8443 ssl http2;', site)
+        self.assertNotIn('listen 443 ssl', site)
+        self.assertEqual((self.root / 'systemctl.log').read_text().count('reload nginx'), 1)
+        self.run_bash('stream_transaction stream_do_disable')
+        self.assertIn('listen 443 ssl http2;', (self.available / 'node.example.com').read_text())
+
+    def test_enable_without_sites_guides_first_node(self):
+        self.remove_all_sites()
+        result = self.run_bash('stream_enable', input='node.example.com\n39149\ny\ny\n')
+        self.assertIn('请添加首个节点', result.stdout)
+        self.assertTrue((self.stream / 'enabled').exists())
+        self.assertIn('node.example.com', (self.stream / 'stream.conf').read_text())
+
+    def test_first_node_also_migrates_existing_sites(self):
+        before = {p.name: p.read_text() for p in self.available.iterdir()}
+        result = self.run_bash('stream_add_node', input='node.example.com\n39149\ny\ny\n')
+        self.assertIn('blog.example.com', result.stdout)
+        self.assertIn('IP ACL', result.stderr)
+        for name, content in before.items():
+            self.assertEqual((self.available / name).read_text().replace('127.0.0.1:8443', '443'), content)
+        self.assertEqual((self.root / 'systemctl.log').read_text().count('reload nginx'), 1)
+
+    def test_first_node_cancellation_keeps_empty_install_unchanged(self):
+        self.remove_all_sites()
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        for answer in ('\n', 'node.example.com\n39149\nn\n', 'node.example.com\n39149\ny\nn\n'):
+            with self.subTest(answer=answer):
+                self.run_bash('stream_add_node', input=answer, success=not answer.endswith('y\nn\n'))
+                self.assert_no_first_node_state(original)
+
+    def test_first_node_check_or_reload_failure_rolls_back_entire_setup(self):
+        self.remove_all_sites()
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        for marker in ('fail_check', 'fail_reload'):
+            with self.subTest(marker=marker):
+                (self.root / marker).touch()
+                self.run_bash('stream_add_node', input='node.example.com\n39149\ny\ny\n', success=False)
+                self.assert_no_first_node_state(original)
+                (self.root / marker).unlink(missing_ok=True)
+
+    def test_first_node_rejects_a_certificate_without_matching_sni(self):
+        self.remove_all_sites()
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        self.run_bash('select_certificate() { return 1; }; stream_add_node',
+                      input='unrelated.example.net\n39149\ny\ny\n', success=False)
+        self.assert_no_first_node_state(original)
+
+    def test_first_node_failure_preserves_existing_sites_and_requires_confirmation(self):
+        before = {p.name: p.read_bytes() for p in self.available.iterdir()}
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        (self.root / 'fail_check').touch()
+        self.run_bash('stream_add_node', input='node.example.com\n39149\ny\ny\n', success=False)
+        self.assertEqual(original, (self.nginx / 'nginx.conf').read_bytes())
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.available.iterdir()})
+        self.assertFalse(list(self.stream.iterdir()))
+        self.run_bash('stream_prepare_website node.example.com && stream_transaction stream_do_add_node node.example.com 39149',
+                      input='y\n', success=False)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.available.iterdir()})
+
     def test_migrate_multiple_sites_preserves_content_and_disable(self):
         before = {p.name: p.read_text() for p in self.available.iterdir()}
         self.enable()
