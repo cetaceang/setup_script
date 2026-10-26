@@ -737,6 +737,7 @@ EOF
 
 write_nginx_acme_config() {
   cat > /etc/nginx/conf.d/acme.conf <<'EOF'
+# Managed by npctl ACME default site
 server {
     listen 80 default_server;
     server_name _;
@@ -751,6 +752,33 @@ server {
     }
 }
 EOF
+}
+
+ensure_safe_update_acme_config() {
+  local dump listener_present result
+  LAST_ENSURE_CREATED=0
+  # An existing file is preserved, including a third-party ACME configuration.
+  if [ -e /etc/nginx/conf.d/acme.conf ] || [ -L /etc/nginx/conf.d/acme.conf ]; then
+    return 0
+  fi
+  require_command python3 "请先安装 python3。" || return 1
+  [ -f "$SCRIPT_DIR/npctl_stream_config.py" ] || { warn "请使用完整仓库更新 npctl。"; return 1; }
+  dump=$(mktemp) || return 1
+  if ! nginx -T >"$dump"; then
+    rm -f "$dump"
+    warn "现有 Nginx 配置无效，未创建全局 ACME 默认站点。"
+    return 1
+  fi
+  listener_present=$(python3 "$SCRIPT_DIR/npctl_stream_config.py" has-listener "$dump" 80)
+  result=$?
+  rm -f "$dump"
+  [ "$result" -eq 0 ] || return 1
+  if [ "$listener_present" = yes ]; then
+    echo "已有加载的 80 端口监听，保留现有默认站点，跳过新增全局 ACME 默认站点。"
+    echo "HTTP-01 验证需由对应现有站点提供 Webroot；npctl 管理的网站仍保留 ACME snippet，也可使用 DNS 验证。"
+    return 0
+  fi
+  ensure_file_if_missing /etc/nginx/conf.d/acme.conf write_nginx_acme_config
 }
 
 write_nginx_snippet_acme_webroot() {
@@ -912,6 +940,10 @@ safe_update_npctl() {
   SAFE_UPDATE_CREATED_FILES=()
 
   install_missing_packages "${NGINX_PACKAGES[@]}" || return 1
+  if ! nginx -t; then
+    warn "现有 Nginx 配置校验失败，未修改配置；请先处理原有配置错误。"
+    return 1
+  fi
 
   ensure_directory_if_missing /var/cache/nginx || return 1
   ensure_directory_if_missing /var/cache/nginx/assets_cache "www-data:www-data" || return 1
@@ -927,7 +959,7 @@ safe_update_npctl() {
   ensure_directory_if_missing "$CLOUDFLARE_CREDENTIALS_DIR" "" "0700" || return 1
   # Existing default/third-party sites are not removed during a safe update.
 
-  ensure_file_if_missing /etc/nginx/conf.d/acme.conf write_nginx_acme_config || return 1
+  ensure_safe_update_acme_config || return 1
   if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
     nginx_files_created=1
   fi

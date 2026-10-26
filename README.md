@@ -4,6 +4,8 @@
 
 更新时请取得完整仓库，然后运行 `sudo bash setup.sh`，选择 **9. 安全更新 npctl**。选项 8 检测到现有 `nginx.conf` 时也改用安全更新；不会重写现有主配置、网站或 SNI 映射。辅助文件 `npctl_stream.sh`、`npctl_stream_config.py` 随管理命令安装到 `/usr/local/lib/npctl/`，不要仅下载单个入口脚本。
 
+安全更新先校验原有 Nginx 配置，再从 `nginx -T` 检测实际加载的监听。已有 80 端口监听时，不再补建带 `default_server` 的全局 `conf.d/acme.conf`，保留 Debian/Ubuntu 自带 `sites-enabled/default` 以及第三方默认站点；已有 `acme.conf` 也保持原样。完全没有 80 监听时才补建本工具的 ACME 默认站点。npctl 网站自身的 ACME Webroot snippet 保持不变；使用第三方默认站点为新域名申请 HTTP-01 证书时，需由该站点提供正确的验证目录，或改用 DNS 验证。原配置已无效时停止更新；本轮补齐后校验失败会删除本轮新建文件。
+
 ## 启用并迁移已有网站
 
 运行 `sudo npctl` → **5. SNI 分流管理** → **1. 启用**。工具先执行 `nginx -t/-T`，检测实际加载的配置、端口、站点链接及 Stream 模块，列出将迁移的 npctl 网站，说明客户端 IP 的影响，确认后执行事务。**没有现成网站也可以使用**：此时「启用」会引导添加首个节点，选择「同机回落」或「纯中转」。纯中转不要求本机有网站、节点域名证书或 Certbot。

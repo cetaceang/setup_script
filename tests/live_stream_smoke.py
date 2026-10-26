@@ -123,6 +123,8 @@ def main():
                     assert b'Welcome' in request('node1.example.com', 8443)
                     redirect = request('blog.example.com', 80)
                     assert b'308' in redirect and b'https://blog.example.com/' in redirect, redirect
+                    if (root / 'nginx/sites-enabled/default').exists():
+                        assert b'original-default' in request('unknown.example.com', 80)
                     assert b'acme-ok' in request('blog.example.com', 80, '/.well-known/acme-challenge/test-token')
                     assert b'101' in request('blog.example.com', path='/ws', upgrade=True)
                     context.set_alpn_protocols(['h2'])

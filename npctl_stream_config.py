@@ -103,6 +103,39 @@ def local_only_fallback(text):
     return True
 
 
+def has_listener(dump_path, listener_port):
+    # nginx -T can contain includes with independent server blocks. Be
+    # conservative about HTTP's implicit :80 and address-without-port syntax.
+    scopes = []
+    current = []
+    for value, _, _ in tokens(Path(dump_path).read_text()):
+        if value == '{':
+            scopes.append([current[0] if current else '', False])
+            current = []
+        elif value == '}':
+            if scopes:
+                name, explicit_listen = scopes.pop()
+                if name == 'server' and not explicit_listen and listener_port == 80:
+                    return True
+            current = []
+        elif value == ';':
+            if len(current) > 1 and current[0] == 'listen':
+                for scope in reversed(scopes):
+                    if scope[0] == 'server':
+                        scope[1] = True
+                        break
+                address = current[1].strip('\"\'')
+                found_port = port(address)
+                if found_port is None and not address.startswith('unix:'):
+                    found_port = 80
+                if found_port == listener_port:
+                    return True
+            current = []
+        else:
+            current.append(value)
+    return False
+
+
 def migrate(paths, metadata_path, enable):
     metadata_file = Path(metadata_path)
     metadata = json.loads(metadata_file.read_text()) if metadata_file.exists() else {}
@@ -206,10 +239,15 @@ def main():
     check.add_argument('dump')
     check.add_argument('managed_stream')
     check.add_argument('paths', nargs='*')
+    listener = sub.add_parser('has-listener')
+    listener.add_argument('dump')
+    listener.add_argument('port', type=int)
     args = parser.parse_args()
     try:
         if args.command == 'migrate':
             migrate(args.paths, args.metadata, args.direction == 'enable')
+        elif args.command == 'has-listener':
+            print('yes' if has_listener(args.dump, args.port) else 'no')
         else:
             probe(args.dump, args.paths, args.managed_stream)
     except (ValueError, OSError, KeyError, TypeError) as error:

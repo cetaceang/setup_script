@@ -666,6 +666,104 @@ safe_update_npctl && safe_update_npctl
         for p, content in before.items():
             self.assertEqual(p.read_bytes(), content)
 
+    def create_distribution_default(self):
+        site = self.available / 'default'
+        site.write_text('''# Distribution-owned default; npctl must preserve it.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    location / { return 200 "original-default"; }
+}
+''')
+        (self.enabled / 'default').symlink_to(site)
+        return site
+
+    def safe_update(self, *, success=True, code='safe_update_npctl'):
+        self.stub('chown', '#!/bin/bash\nexit 0\n')
+        return self.run_bash('source "$1/setup.sh"; install_missing_packages() { return 0; }; ' + code,
+                             main=False, success=success)
+
+    def test_safe_update_keeps_distribution_default_without_duplicate_default_server(self):
+        default = self.create_distribution_default()
+        before = {p: p.read_bytes() for p in [self.nginx / 'nginx.conf', *self.available.iterdir()]}
+        link = (self.enabled / 'default').readlink()
+        result = self.safe_update(code='safe_update_npctl && safe_update_npctl')
+        self.assertIn('跳过新增全局 ACME 默认站点', result.stdout)
+        self.assertFalse((self.nginx / 'conf.d/acme.conf').exists())
+        self.assertEqual((self.enabled / 'default').readlink(), link)
+        self.assertTrue(default.is_file())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_safe_update_creates_acme_default_only_when_no_http_listener_exists(self):
+        self.remove_all_sites()
+        original = (self.nginx / 'nginx.conf').read_bytes()
+        self.safe_update()
+        acme = self.nginx / 'conf.d/acme.conf'
+        self.assertIn('listen 80 default_server;', acme.read_text())
+        self.assertIn('# Managed by npctl ACME default site', acme.read_text())
+        before = acme.read_bytes()
+        self.safe_update()
+        self.assertEqual(acme.read_bytes(), before)
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), original)
+
+    def test_safe_update_preserves_existing_third_party_acme_config(self):
+        acme = self.nginx / 'conf.d/acme.conf'
+        acme.write_text('server { listen 8080; server_name custom.example.net; return 200 "owned-by-user"; }\n')
+        before = acme.read_bytes()
+        self.safe_update()
+        self.assertEqual(acme.read_bytes(), before)
+
+    def test_safe_update_stops_before_changes_when_original_nginx_config_is_invalid(self):
+        self.stub('nginx', '#!/bin/bash\nexit 1\n')
+        before = {p: p.read_bytes() for p in [self.nginx / 'nginx.conf', *self.available.iterdir()]}
+        result = self.safe_update(success=False)
+        self.assertIn('现有 Nginx 配置校验失败', result.stderr)
+        self.assertFalse((self.nginx / 'conf.d/acme.conf').exists())
+        self.assertFalse((self.root / 'usr/local/bin/npctl').exists())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_safe_update_failed_final_check_removes_only_new_acme_files(self):
+        self.remove_all_sites()
+        before = (self.nginx / 'nginx.conf').read_bytes()
+        self.safe_update(success=False, code='''nginx() {
+  [[ ! -f $FIXTURE/nginx/conf.d/acme.conf ]] || return 1
+  command nginx "$@"
+}
+safe_update_npctl''')
+        self.assertFalse((self.nginx / 'conf.d/acme.conf').exists())
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), before)
+        self.assertNotIn('reload nginx', (self.root / 'systemctl.log').read_text()
+                         if (self.root / 'systemctl.log').exists() else '')
+
+    def test_http_listener_detection_uses_loaded_directives_and_implicit_port_80(self):
+        dump = self.root / 'dump.conf'
+        cases = [('server { listen 80 default_server; }', True),
+                 ('server { listen [::]:80 default_server; }', True),
+                 ('server { listen 127.0.0.1:80; }', True),
+                 ('server { listen "80"; }', True),
+                 ('server { listen 127.0.0.1; }', True),
+                 ('server { server_name example.com; return 200 "hello"; }', True),
+                 ('http { # listen 80 default_server;\n }', False),
+                 ('server { listen 443 ssl; set $example "listen 80;"; }', False),
+                 ('server { listen unix:/tmp/example.sock; }', False)]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                dump.write_text(text)
+                self.assertEqual(parser.has_listener(dump, 80), expected)
+
+    @unittest.skipUnless(os.environ.get('NPCTL_TEST_NETNS') == '1' and os.environ.get('NPCTL_TEST_NGINX'),
+                         'requires unpacked nginx and sudo unshare -n')
+    def test_live_safe_update_keeps_default_http_site_and_npctl_acme_routes(self):
+        self.create_distribution_default()
+        self.safe_update()
+        self.enable()
+        self.add('node1.example.com', 34138)
+        self.add('node2.example.com', 39149)
+        self.run_live_smoke()
+
     def test_ipv4_ipv6_listener_pair_is_restored_on_disable(self):
         site = self.available / 'blog.example.com'
         site.write_text(site.read_text().replace('listen 443 ssl http2;', 'listen 443 ssl http2;\n    listen [::]:443 ssl http2;'))
@@ -753,7 +851,7 @@ if [[ $1 == -s ]]; then echo 'Inst libnginx-mod-stream (test)'; exit 0; fi
         self.run_live_smoke('local-only')
 
     def run_live_smoke(self, mode='full'):
-        (self.root / 'acme/.well-known/acme-challenge').mkdir(parents=True)
+        (self.root / 'acme/.well-known/acme-challenge').mkdir(parents=True, exist_ok=True)
         result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'python3', str(REPO / 'tests/live_stream_smoke.py'),
                                  str(self.root), self.env['NPCTL_TEST_NGINX'], mode], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
