@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Isolated configuration/rollback tests; never use /etc or a running service.
+
+Set NPCTL_TEST_NGINX and NPCTL_TEST_STREAM_MODULE to unpacked distribution
+binaries to also run real nginx -t/-T. systemctl, ss and Certbot stay mocked.
+"""
+import importlib.util
+import os
+import pwd
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('stream_config', REPO / 'npctl_stream_config.py')
+parser = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(parser)
+
+
+class StreamTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='npctl-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.nginx = self.root / 'nginx'
+        self.available = self.nginx / 'sites-available'
+        self.enabled = self.nginx / 'sites-enabled'
+        self.stream = self.nginx / 'npctl-stream'
+        self.cert = self.root / 'letsencrypt'
+        self.bin = self.root / 'bin'
+        self.lib = self.root / 'scripts'
+        for directory in (self.available, self.enabled, self.stream, self.cert / 'live/example.com', self.bin, self.lib,
+                          self.nginx / 'snippets', self.nginx / 'conf.d', self.nginx / 'modules-enabled', self.root / 'acme'):
+            directory.mkdir(parents=True, exist_ok=True)
+        replacements = {'/etc/nginx': str(self.nginx), '/etc/letsencrypt': str(self.cert),
+                        '/var/www/acme': str(self.root / 'acme'), '/var/www/npctl-fallback': str(self.root / 'web'),
+                        '/run/npctl-stream.lock': str(self.root / 'lock'), '/var/backups/npctl': str(self.root / 'backups'),
+                        '/usr/local': str(self.root / 'usr/local'), '/root/.secrets': str(self.root / 'secrets'),
+                        '/usr/sbin': str(self.root / 'usr/sbin'), '/run/npctl-stream-module.lock': str(self.root / 'module-lock'),
+                        '/var/cache/nginx': str(self.root / 'cache')}
+        for name in ('nginx_proxy_control.sh', 'setup.sh', 'npctl_stream.sh', 'npctl_stream_config.py'):
+            text = (REPO / name).read_text()
+            for old, new in replacements.items():
+                text = text.replace(old, new).replace(old.replace('/', '\\/'), new.replace('/', '\\/'))
+            (self.lib / name).write_text(text)
+        self.env = os.environ.copy()
+        self.env['PATH'] = str(self.bin) + ':' + self.env['PATH']
+        self.env['FIXTURE'] = str(self.root)
+        self.env['MAIN'] = str(self.nginx / 'nginx.conf')
+        self.stub('systemctl', '''#!/bin/bash
+printf '%s\\n' "$*" >> "$FIXTURE/systemctl.log"
+if [[ $1 == show ]]; then
+  printf '{ path=%s ; argv[]=%s -g daemon on; master_process on; ; ignore_errors=no ; }\\n' "$(command -v nginx)" "$(command -v nginx)"
+fi
+if [[ $1 == reload && -f $FIXTURE/fail_reload ]]; then rm "$FIXTURE/fail_reload"; exit 1; fi
+''')
+        self.stub('ss', '#!/bin/bash\ncat "$FIXTURE/sockets" 2>/dev/null || true\n')
+        self.stub('certbot', '''#!/bin/bash
+[[ $1 == certificates ]] || exit 1
+cat <<EOF
+Certificate Name: example.com
+Domains: example.com *.example.com
+Expiry Date: 2099-01-01
+EOF
+''')
+        self.stub('nginx', '''#!/bin/bash
+if [[ -f $FIXTURE/fail_check && -f $FIXTURE/nginx/npctl-stream/enabled ]]; then exit 1; fi
+if [[ ${NPCTL_TEST_NGINX:-} ]]; then
+  if [[ ${NPCTL_TEST_NETNS:-} == 1 ]]; then
+    exec sudo -n unshare -n "$NPCTL_TEST_NGINX" -p "$FIXTURE/nginx/" -e stderr "$@" -c "$MAIN"
+  fi
+  exec "$NPCTL_TEST_NGINX" -p "$FIXTURE/nginx/" -e stderr "$@" -c "$MAIN"
+fi
+if [[ $1 == -T ]]; then
+  for f in "$MAIN" "$FIXTURE"/nginx/sites-enabled/* "$FIXTURE"/nginx/conf.d/*.conf; do
+    [[ -f $f ]] || continue
+    printf '# configuration file %s:\\n' "$f"; cat "$f"
+  done
+  if [[ -f $FIXTURE/nginx/npctl-stream/enabled ]]; then
+    printf '# configuration file %s:\\n' "$FIXTURE/nginx/npctl-stream/stream.conf"
+    cat "$FIXTURE/nginx/npctl-stream/stream.conf"
+  fi
+fi
+''')
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+                        '-keyout', str(self.cert / 'live/example.com/privkey.pem'), '-out', str(self.cert / 'live/example.com/fullchain.pem'),
+                        '-days', '1', '-subj', '/CN=example.com', '-addext', 'subjectAltName=DNS:example.com,DNS:*.example.com'],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        module = self.env.get('NPCTL_TEST_STREAM_MODULE')
+        main = f'load_module {module};\n' if module else ''
+        main += f'''user {pwd.getpwuid(os.getuid()).pw_name};
+pid {self.root}/nginx.pid;
+error_log stderr;
+events {{}}
+http {{
+ access_log off;
+ client_body_temp_path {self.root}/body;
+ proxy_temp_path {self.root}/proxy;
+ fastcgi_temp_path {self.root}/fastcgi;
+ uwsgi_temp_path {self.root}/uwsgi;
+ scgi_temp_path {self.root}/scgi;
+ map $http_upgrade $connection_upgrade {{ default upgrade; "" close; }}
+ include {self.enabled}/*;
+ include {self.nginx}/conf.d/*.conf;
+}}
+'''
+        (self.nginx / 'nginx.conf').write_text(main)
+        snippets = {'acme-webroot.conf': f'location ^~ /.well-known/acme-challenge/ {{ root {self.root}/acme; try_files $uri =404; }}',
+                    'redirect-https-308.conf': 'location / { return 308 https://$host$request_uri; }',
+                    'security-headers.conf': 'add_header X-Content-Type-Options nosniff;',
+                    'proxy-common.conf': 'proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade;',
+                    'block-common-exploits.optional.conf': '', 'proxy-cache-assets.optional.conf': '', 'cache-assets.optional.conf': ''}
+        for name, content in snippets.items():
+            (self.nginx / 'snippets' / name).write_text(content + '\n')
+        (self.cert / 'options-ssl-nginx.conf').write_text('ssl_protocols TLSv1.2 TLSv1.3;\n')
+        self.run_bash('source "$1/setup.sh"; write_letsencrypt_dhparams_file', main=False)
+        self.create_site('blog.example.com')
+        self.create_site('api.example.com')
+
+    def stub(self, name, text):
+        path = self.bin / name
+        path.write_text(text)
+        path.chmod(0o755)
+
+    def run_bash(self, code, *, main=True, success=True, input=None):
+        source = 'source "$1/nginx_proxy_control.sh"; ' if main else ''
+        result = subprocess.run(['bash', '-c', source + code, 'test', str(self.lib)], env=self.env,
+                                input=input, text=True, capture_output=True)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def create_site(self, domain):
+        self.run_bash(f'''SITE_DOMAIN={domain}; UPSTREAM_IP=127.0.0.1; UPSTREAM_PORT=3000;
+SELECTED_CERT_NAME=example.com; CLIENT_MAX_BODY_SIZE=64M;
+ENABLE_BLOCK_COMMON_EXPLOITS=1; ENABLE_PROXY_CACHE_ASSETS=1; ENABLE_BROWSER_CACHE_HEADERS=1;
+build_site_config "$NGINX_SITES_AVAILABLE_DIR/{domain}" {domain.replace('.', '_')}_upstream || exit 1
+ln -s "$NGINX_SITES_AVAILABLE_DIR/{domain}" "$NGINX_SITES_ENABLED_DIR/{domain}"
+''')
+
+    def enable(self):
+        self.run_bash('stream_transaction stream_do_enable')
+
+    def add(self, domain, port):
+        self.run_bash(f'stream_prepare_website {domain} && stream_transaction stream_do_add_node {domain} {port}', input='y\n')
+
+    def test_migrate_multiple_sites_preserves_content_and_disable(self):
+        before = {p.name: p.read_text() for p in self.available.iterdir()}
+        self.enable()
+        for p in self.available.iterdir():
+            self.assertEqual(p.read_text().replace('127.0.0.1:8443', '443'), before[p.name])
+        self.run_bash('stream_transaction stream_do_disable')
+        for p in self.available.iterdir():
+            self.assertEqual(p.read_text(), before[p.name])
+        self.assertFalse((self.stream / 'enabled').exists())
+
+    def test_multiple_nodes_certificate_fallback_and_independent_delete(self):
+        self.enable()
+        self.add('node1.example.com', 34138)
+        self.add('node2.example.com', 39149)
+        text = (self.stream / 'stream.conf').read_text()
+        self.assertIn('listen [::]:443', text)
+        self.assertIn('node1.example.com npctl_reality_0;', text)
+        self.assertIn('127.0.0.1:39149', text)
+        self.assertIn('default npctl_https_fallback;', text)
+        self.run_bash('stream_show_nodes')
+        self.run_bash('stream_transaction stream_do_delete_node node1.example.com')
+        self.assertTrue((self.available / 'node1.example.com').exists())
+        self.assertTrue((self.cert / 'live/example.com/fullchain.pem').exists())
+        self.assertNotIn('node1.example.com', (self.stream / 'nodes.tsv').read_text())
+
+    def test_duplicate_invalid_and_reserved_nodes_rejected(self):
+        self.enable()
+        self.add('node1.example.com', 34138)
+        for domain, port in [('node1.example.com', '39149'), ('node2.example.com', '34138'),
+                             ('x;bad.example.com', '39149'), ('node2.example.com', '8443'),
+                             ('node2.example.com', '000443'), ('node2.example.com', '999999999999999999')]:
+            self.run_bash(f'stream_validate_node "{domain}" "{port}"', success=False)
+
+    def test_new_ordinary_site_and_body_size_certificate_management(self):
+        self.enable()
+        self.create_site('new.example.com')
+        self.assertIn('listen 127.0.0.1:8443 ssl http2;', (self.available / 'new.example.com').read_text())
+        self.run_bash('''site="$NGINX_SITES_AVAILABLE_DIR/new.example.com"
+is_npctl_managed_site_file "$site" || exit 1
+[[ $(extract_site_client_max_body_size "$site") == 64M ]] || exit 1
+rewrite_site_client_max_body_size_config "$site" set 2G "$site.tmp" || exit 1
+[[ $(extract_site_client_max_body_size "$site.tmp") == 2G ]] || exit 1
+rewrite_site_certificate_config "$site" example.com other.example.com "$site.cert" || exit 1
+[[ $(extract_site_certificate_name_from_config "$site.cert") == other.example.com ]]
+''')
+
+    def test_certificate_must_cover_sni_and_not_expired(self):
+        self.run_bash('stream_certificate_valid node.example.com example.com')
+        self.run_bash('stream_certificate_valid node.other.com example.com', success=False)
+        self.run_bash('stream_certificate_valid a.b.example.com example.com', success=False)
+        expired = self.cert / 'live/expired.example.com'
+        expired.mkdir()
+        shutil.copy(self.cert / 'live/example.com/privkey.pem', expired / 'privkey.pem')
+        subprocess.run(['openssl', 'x509', '-in', str(self.cert / 'live/example.com/fullchain.pem'),
+                        '-signkey', str(expired / 'privkey.pem'), '-days', '0', '-out', str(expired / 'fullchain.pem')],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.run_bash('stream_certificate_valid node.example.com expired.example.com', success=False)
+
+    def test_existing_website_is_reused(self):
+        self.enable()
+        before = (self.available / 'blog.example.com').read_bytes()
+        self.add('blog.example.com', 34138)
+        self.assertEqual((self.available / 'blog.example.com').read_bytes(), before)
+
+    def test_validation_failure_rolls_back_all_sites(self):
+        before = (self.nginx / 'nginx.conf').read_bytes()
+        sites = {p.name: p.read_bytes() for p in self.available.iterdir()}
+        (self.root / 'fail_check').touch()
+        self.run_bash('stream_transaction stream_do_enable', success=False)
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), before)
+        self.assertFalse((self.stream / 'enabled').exists())
+        for p in self.available.iterdir():
+            self.assertEqual(p.read_bytes(), sites[p.name])
+
+    def test_reload_failure_restores_and_reloads_previous_config(self):
+        before = (self.nginx / 'nginx.conf').read_bytes()
+        (self.root / 'fail_reload').touch()
+        self.run_bash('stream_transaction stream_do_enable', success=False)
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), before)
+        calls = (self.root / 'systemctl.log').read_text()
+        self.assertEqual(calls.count('reload nginx'), 2)
+
+    def test_third_party_443_rejected_and_external_socket_rejected(self):
+        (self.nginx / 'conf.d/third.conf').write_text('server { listen 443; }\n')
+        self.run_bash('stream_check_layout', success=False)
+        (self.nginx / 'conf.d/third.conf').unlink()
+        (self.root / 'sockets').write_text('LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("other",pid=123,fd=4))\n')
+        self.run_bash('stream_check_layout', success=False)
+
+    def test_unknown_listener_structure_rejected_without_partial_migration(self):
+        before = (self.available / 'api.example.com').read_bytes()
+        site = self.available / 'blog.example.com'
+        site.write_text(site.read_text().replace('443 ssl http2;', '443 ssl http2 proxy_protocol;'))
+        self.run_bash('stream_transaction stream_do_enable', success=False)
+        self.assertEqual((self.available / 'api.example.com').read_bytes(), before)
+
+    def test_repeated_enable_disable_and_manual_rollback(self):
+        self.enable()
+        before = (self.nginx / 'nginx.conf').read_bytes()
+        self.run_bash('stream_enable')
+        self.assertEqual((self.nginx / 'nginx.conf').read_bytes(), before)
+        self.run_bash('stream_transaction stream_do_disable')
+        self.run_bash('stream_disable')
+        backup = sorted((self.root / 'backups').iterdir(), key=lambda p: p.stat().st_mtime)[-1]
+        self.run_bash(f'bash "{backup}/rollback.sh"')
+        self.assertTrue((self.stream / 'enabled').exists())
+
+    def test_setup_repeated_install_uses_safe_update_and_keeps_sni(self):
+        self.enable()
+        before = {p: p.read_bytes() for p in [self.nginx / 'nginx.conf', self.stream / 'stream.conf', self.stream / 'enabled']}
+        self.run_bash('''source "$1/setup.sh"
+safe_update_npctl() { echo safe-update >> "$FIXTURE/setup.log"; }
+setup_nginx_certbot
+''', main=False)
+        self.assertEqual((self.root / 'setup.log').read_text(), 'safe-update\n')
+        for p, content in before.items():
+            self.assertEqual(p.read_bytes(), content)
+
+    def test_actual_safe_update_preserves_existing_stream_and_sites(self):
+        self.enable()
+        self.add('node.example.com', 39149)
+        paths = [self.nginx / 'nginx.conf', *self.stream.iterdir(), *self.available.iterdir()]
+        before = {p: p.read_bytes() for p in paths}
+        self.stub('chown', '#!/bin/bash\nexit 0\n')
+        self.run_bash('''source "$1/setup.sh"
+install_missing_packages() { return 0; }
+safe_update_npctl && safe_update_npctl
+''', main=False)
+        for p, content in before.items():
+            self.assertEqual(p.read_bytes(), content)
+
+    def test_ipv4_ipv6_listener_pair_is_restored_on_disable(self):
+        site = self.available / 'blog.example.com'
+        site.write_text(site.read_text().replace('listen 443 ssl http2;', 'listen 443 ssl http2;\n    listen [::]:443 ssl http2;'))
+        self.enable()
+        self.assertEqual(site.read_text().count('listen 127.0.0.1:8443'), 1)
+        self.run_bash('stream_transaction stream_do_disable')
+        self.assertIn('listen 443 ssl http2;', site.read_text())
+        self.assertIn('listen [::]:443 ssl http2;', site.read_text())
+
+    def test_websocket_http2_acme_redirect_and_certificate_references_preserved(self):
+        self.enable()
+        for site in self.available.iterdir():
+            content = site.read_text()
+            for expected in ('ssl http2;', 'listen 80;', 'acme-webroot.conf;', 'redirect-https-308.conf;',
+                             'proxy-common.conf;', 'fullchain.pem;', 'privkey.pem;', 'client_max_body_size 64M;'):
+                self.assertIn(expected, content)
+        self.add('node.example.com', 39149)
+        result = self.run_bash('load_certificate_referenced_sites example.com; printf "%s\\n" "${CERTIFICATE_REFERENCED_SITE_NAMES[@]}"')
+        self.assertIn('node.example.com', result.stdout)
+        self.run_bash('stream_guard_disable_site "$NGINX_SITES_AVAILABLE_DIR/node.example.com"', success=False)
+
+    def test_foreign_metadata_and_cancelled_fallback_are_not_overwritten(self):
+        (self.stream / 'nodes.tsv').write_text('foreign data\n')
+        self.run_bash('stream_transaction stream_do_enable', success=False)
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(), 'foreign data\n')
+        (self.stream / 'nodes.tsv').unlink()
+        self.enable()
+        self.run_bash('stream_prepare_website node.example.com', input='n\n', success=False)
+        self.assertFalse((self.available / 'node.example.com').exists())
+
+    def test_module_install_blocks_nginx_hooks_and_restores_host_policy(self):
+        policy = self.root / 'usr/sbin/policy-rc.d'
+        policy.parent.mkdir(parents=True)
+        policy.write_text('#!/bin/bash\nexit 7\n')
+        policy.chmod(0o755)
+        before = policy.read_bytes()
+        self.stub('apt', '#!/bin/bash\nexit 0\n')
+        self.stub('apt-get', '''#!/bin/bash
+if [[ $1 == -s ]]; then echo 'Inst libnginx-mod-stream (test)'; exit 0; fi
+"$FIXTURE/usr/sbin/policy-rc.d" nginx reload
+[[ $? == 101 ]] || exit 1
+"$FIXTURE/usr/sbin/policy-rc.d" other start
+[[ $? == 7 ]] || exit 1
+[[ ! -f $FIXTURE/fail_package ]]
+''')
+        self.run_bash('stream_install_module_package')
+        self.assertEqual(policy.read_bytes(), before)
+        (self.root / 'fail_package').touch()
+        self.run_bash('stream_install_module_package', success=False)
+        self.assertEqual(policy.read_bytes(), before)
+
+    @unittest.skipUnless(os.environ.get('NPCTL_TEST_NETNS') == '1' and os.environ.get('NPCTL_TEST_NGINX'),
+                         'requires unpacked nginx and sudo unshare -n')
+    def test_live_namespace_sni_tls_http_and_websocket(self):
+        self.enable()
+        self.add('node1.example.com', 34138)
+        self.add('node2.example.com', 39149)
+        (self.root / 'acme/.well-known/acme-challenge').mkdir(parents=True)
+        result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'python3', str(REPO / 'tests/live_stream_smoke.py'),
+                                 str(self.root), self.env['NPCTL_TEST_NGINX']], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

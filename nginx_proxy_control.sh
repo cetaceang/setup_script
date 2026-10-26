@@ -2,7 +2,6 @@
 
 set -uo pipefail
 
-readonly PROGRAM_NAME="npctl"
 readonly ACME_WEBROOT="/var/www/acme"
 readonly NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
 readonly NGINX_SITES_AVAILABLE_DIR="/etc/nginx/sites-available"
@@ -23,6 +22,19 @@ CLIENT_MAX_BODY_SIZE=""
 SELECTED_CERT_NAME=""
 SELECTED_CERT_DOMAINS=""
 SELECTED_CERT_EXPIRY=""
+
+# The installed command keeps its helpers in /usr/local/lib/npctl. A checkout
+# loads adjacent helpers, so local testing and setup use the same implementation.
+NPCTL_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$NPCTL_HELPER_DIR/npctl_stream.sh" ]; then
+  NPCTL_HELPER_DIR=/usr/local/lib/npctl
+fi
+if [ -f "$NPCTL_HELPER_DIR/npctl_stream.sh" ]; then
+  . "$NPCTL_HELPER_DIR/npctl_stream.sh"
+else
+  site_https_listener() { printf '%s' 443; }
+  manage_stream() { warn "请先使用 setup 选项 9 安装完整的 SNI 管理功能。"; return 1; }
+fi
 
 declare -a CERTIFICATE_NAMES=()
 declare -a CERTIFICATE_DOMAINS=()
@@ -117,7 +129,7 @@ validate_ipv4() {
 validate_port() {
   local port="$1"
 
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
@@ -903,7 +915,7 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen $(site_https_listener) ssl http2;
     server_name ${SITE_DOMAIN};
 EOF
 
@@ -1291,7 +1303,7 @@ extract_site_client_max_body_size() {
 
       lines[++line_count] = $0
 
-      if ($0 ~ /^[[:space:]]*listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
+      if ($0 ~ /^[[:space:]]*listen[[:space:]]+(443|127\.0\.0\.1:8443)[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
         target_server = 1
       }
 
@@ -1430,7 +1442,7 @@ rewrite_site_client_max_body_size_config() {
 
       lines[++line_count] = $0
 
-      if ($0 ~ /^[[:space:]]*listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
+      if ($0 ~ /^[[:space:]]*listen[[:space:]]+(443|127\.0\.0\.1:8443)[[:space:]]+ssl[[:space:]]+http2;[[:space:]]*$/) {
         target_server = 1
       }
 
@@ -1455,7 +1467,7 @@ is_npctl_legacy_site_file() {
   local site_file="$1"
 
   grep -Fq "listen 80;" "$site_file" || return 1
-  grep -Fq "listen 443 ssl http2;" "$site_file" || return 1
+  grep -Eq "listen (443|127\.0\.0\.1:8443) ssl http2;" "$site_file" || return 1
   grep -Fq "include /etc/nginx/snippets/acme-webroot.conf;" "$site_file" || return 1
   grep -Fq "include /etc/nginx/snippets/redirect-https-308.conf;" "$site_file" || return 1
   grep -Fq "include /etc/nginx/snippets/security-headers.conf;" "$site_file" || return 1
@@ -1715,6 +1727,9 @@ disable_site() {
 
   enabled_file="${NGINX_SITES_ENABLED_DIR}/${site_name}"
   available_file="${NGINX_SITES_AVAILABLE_DIR}/${site_name}"
+  if declare -F stream_guard_disable_site >/dev/null; then
+    stream_guard_disable_site "$available_file" || return 1
+  fi
   server_names="$(extract_server_names_from_config "$available_file")"
   cert_name="$(extract_site_certificate_name_from_config "$available_file" 2>/dev/null || true)"
 
@@ -2117,7 +2132,7 @@ change_site_client_max_body_size() {
   }
 
   rewrite_site_client_max_body_size_config "$available_file" "$action" "$new_client_max_body_size" "$temp_file" || {
-    warn "仅支持修改 npctl 模板站点中 443 server 块里的 client_max_body_size。"
+    warn "仅支持修改 npctl 模板站点中 HTTPS server 块里的 client_max_body_size。"
     rm -f "$temp_file" "$backup_file"
     return 1
   }
@@ -2349,6 +2364,7 @@ show_menu() {
  2. 证书管理
  3. 站点管理
  4. 更新 nginx
+ 5. SNI 分流管理（Stream / REALITY）
  q. 退出
 ====================================================
 每次请输入一个编号
@@ -2363,6 +2379,7 @@ run_task() {
     2) manage_certificates ;;
     3) manage_sites ;;
     4) update_nginx_package ;;
+    5) manage_stream ;;
     *)
       warn "无效选项 [$choice]"
       return 1
@@ -2400,4 +2417,4 @@ main() {
   done
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

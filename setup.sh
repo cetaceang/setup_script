@@ -11,7 +11,7 @@ DOT_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dot.conf"
 PLAIN_DNS_CONFIG="${RESOLVED_CONFIG_DIR}/dns.conf"
 BASE_PACKAGES=(vim curl bubblewrap)
 SECURITY_PACKAGES=(ufw fail2ban)
-NGINX_PACKAGES=(nginx certbot python3-certbot-dns-cloudflare)
+NGINX_PACKAGES=(nginx certbot python3-certbot-dns-cloudflare python3 openssl iproute2)
 NPCTL_SOURCE_SCRIPT="${SCRIPT_DIR}/nginx_proxy_control.sh"
 NPCTL_TARGET_PATH="/usr/local/bin/npctl"
 CLOUDFLARE_CREDENTIALS_DIR="/root/.secrets/certbot"
@@ -885,6 +885,16 @@ install_certbot_nginx_deploy_hook() {
 }
 
 install_npctl_command() {
+  local helper
+  for helper in npctl_stream.sh npctl_stream_config.py; do
+    if [ ! -f "$SCRIPT_DIR/$helper" ]; then
+      warn "未找到 npctl 辅助文件 [$SCRIPT_DIR/$helper]，未更新管理命令。"
+      return 1
+    fi
+  done
+  bash -n "$NPCTL_SOURCE_SCRIPT" && bash -n "$SCRIPT_DIR/npctl_stream.sh" || return 1
+  mkdir -p /usr/local/lib/npctl || return 1
+  install -m 0644 "$SCRIPT_DIR/npctl_stream.sh" "$SCRIPT_DIR/npctl_stream_config.py" /usr/local/lib/npctl/ || return 1
   if [ ! -f "$NPCTL_SOURCE_SCRIPT" ]; then
     warn "未找到 npctl 源脚本 [$NPCTL_SOURCE_SCRIPT]。"
     return 1
@@ -915,7 +925,7 @@ safe_update_npctl() {
   ensure_directory_if_missing /etc/letsencrypt || return 1
   ensure_directory_if_missing /root/.secrets "" "0700" || return 1
   ensure_directory_if_missing "$CLOUDFLARE_CREDENTIALS_DIR" "" "0700" || return 1
-  remove_default_nginx_site || return 1
+  # Existing default/third-party sites are not removed during a safe update.
 
   ensure_file_if_missing /etc/nginx/conf.d/acme.conf write_nginx_acme_config || return 1
   if [ "$LAST_ENSURE_CREATED" -eq 1 ]; then
@@ -1007,6 +1017,13 @@ safe_update_npctl() {
 }
 
 setup_nginx_certbot() {
+  # Re-running setup must never overwrite an existing nginx.conf, including
+  # an enabled SNI router or a third-party main configuration.
+  if [ -e /etc/nginx/nginx.conf ] || [ -L /etc/nginx/nginx.conf ]; then
+    echo "检测到已有 Nginx 配置，保留主配置、网站和 SNI 分流，改用安全更新。"
+    safe_update_npctl
+    return $?
+  fi
   log "8. 安装并配置 Nginx / Certbot / Cloudflare DNS 插件"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
 
@@ -1131,4 +1148,4 @@ main() {
   done
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
