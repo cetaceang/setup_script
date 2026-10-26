@@ -15,6 +15,7 @@ NGINX_PACKAGES=(nginx certbot python3-certbot-dns-cloudflare)
 NPCTL_SOURCE_SCRIPT="${SCRIPT_DIR}/nginx_proxy_control.sh"
 NPCTL_TARGET_PATH="/usr/local/bin/npctl"
 CLOUDFLARE_CREDENTIALS_DIR="/root/.secrets/certbot"
+CERTBOT_NGINX_DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/npctl-reload-nginx"
 PACKAGE_INDEX_UPDATED=0
 LAST_ENSURE_CREATED=0
 declare -a SAFE_UPDATE_CREATED_FILES=()
@@ -869,6 +870,20 @@ write_letsencrypt_tls_files() {
   write_letsencrypt_dhparams_file || return 1
 }
 
+write_certbot_nginx_deploy_hook() {
+  cat > "$CERTBOT_NGINX_DEPLOY_HOOK" <<'EOF'
+#!/bin/sh
+# Managed by npctl. Reload Nginx after a successful certificate renewal.
+nginx -t && systemctl reload nginx
+EOF
+}
+
+install_certbot_nginx_deploy_hook() {
+  ensure_directory_if_missing "$(dirname "$CERTBOT_NGINX_DEPLOY_HOOK")" || return 1
+  ensure_file_if_missing "$CERTBOT_NGINX_DEPLOY_HOOK" write_certbot_nginx_deploy_hook || return 1
+  chmod 0755 "$CERTBOT_NGINX_DEPLOY_HOOK" || return 1
+}
+
 install_npctl_command() {
   if [ ! -f "$NPCTL_SOURCE_SCRIPT" ]; then
     warn "未找到 npctl 源脚本 [$NPCTL_SOURCE_SCRIPT]。"
@@ -954,6 +969,7 @@ safe_update_npctl() {
 
   log "9.1 安装 npctl 命令"
   install_npctl_command || return 1
+  install_certbot_nginx_deploy_hook || return 1
 
   if [ "$nginx_files_created" -eq 1 ]; then
     log "检查 Nginx 配置"
@@ -981,6 +997,7 @@ safe_update_npctl() {
 
   echo "已安全更新 npctl。"
   echo "缺失依赖已安装，已有配置文件未被覆盖。"
+  echo "证书续期成功后将自动校验并重载 Nginx。"
 
   if [ "$nginx_files_created" -eq 1 ]; then
     echo "本次补齐了缺失的 Nginx / Certbot 基础文件。"
@@ -1015,11 +1032,13 @@ setup_nginx_certbot() {
   write_nginx_acme_config || return 1
   write_nginx_snippets || return 1
   write_letsencrypt_tls_files || return 1
+  install_certbot_nginx_deploy_hook || return 1
   log "8.1 安装 npctl 命令"
   install_npctl_command || return 1
 
   nginx -t || return 1
   systemctl reload nginx || return 1
+  echo "证书续期成功后将自动校验并重载 Nginx。"
 }
 
 show_menu() {
