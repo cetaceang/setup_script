@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Official repository tests with isolated paths and mocked package/network tools."""
+import json
 import os
 import subprocess
 import tempfile
@@ -48,7 +49,11 @@ class NginxRepoTests(unittest.TestCase):
 case "$*" in
   *ca-certificates*) printf 'install ok installed' ;;
   *Maintainer*) echo 'NGINX Packaging <nginx-packaging@f5.com>' ;;
-  *nginx-common*) echo 'nginx 1.28.0 installed'; echo 'nginx-common 1.28.0 installed' ;;
+  *'${binary:Package}'*)
+    for package in "$@"; do
+      [[ $package == -* ]] && continue
+      printf '%s\\t1.28.0\\tinstall ok installed\\n' "$package"
+    done ;;
   *Version*) echo '1.28.0-1~noble' ;;
   *) exit 1 ;;
 esac
@@ -67,16 +72,20 @@ if [[ $1 == -s ]]; then
   fi
   exit 0
 fi
-if [[ $* == *--download-only* ]]; then [[ ! -f $FIXTURE/fail_package_download ]]; exit; fi
+if [[ $* == *--download-only* ]]; then
+  if [[ -f $FIXTURE/change_config_after_download ]]; then echo '# concurrent edit' >> "$FIXTURE/nginx/nginx.conf"; fi
+  [[ ! -f $FIXTURE/fail_package_download ]]; exit
+fi
 if [[ $* == *DPkg::Pre-Install-Pkgs* ]]; then
   for arg in "$@"; do
     if [[ $arg == DPkg::Pre-Install-Pkgs::* ]]; then hook=${arg#*=}; fi
   done
-  protocol='VERSION 2\nAPT::Get::Assume-Yes=true\n\nnginx-common 1.28.0 > - **REMOVE**\n'
-  if grep -q '^Remv libnginx-mod-stream ' "$FIXTURE/migration_plan" 2>/dev/null; then
-    protocol+='libnginx-mod-stream 1.28.0 > - **REMOVE**\n'
-  fi
+  protocol='VERSION 2\nAPT::Get::Assume-Yes=true\n\n'
+  while read -r action package rest; do
+    if [[ $action == Remv ]]; then protocol+="$package 1.28.0 > - **REMOVE**\\n"; fi
+  done < "$FIXTURE/migration_plan"
   if [[ -f $FIXTURE/unexpected_removal ]]; then protocol+='unrelated 1.0 > - **REMOVE**\n'; fi
+  if [[ -f $FIXTURE/unexpected_known_removal ]]; then protocol+='nginx-core 1.0 > - **REMOVE**\n'; fi
   printf '%b' "$protocol" | "$hook" || exit 100
   "$FIXTURE/usr/sbin/policy-rc.d" nginx start
   [[ $? == 101 ]] || exit 1
@@ -85,6 +94,9 @@ if [[ $* == *DPkg::Pre-Install-Pkgs* ]]; then
   if [[ -f $FIXTURE/stream-target && ! -f $FIXTURE/old_binary_on_failure && ! -f $FIXTURE/keep_stream_target ]]; then
     target=$(cat "$FIXTURE/stream-target")
     if [[ -e $target ]]; then rm "$target"; fi
+  fi
+  if [[ -f $FIXTURE/legacy-targets && ! -f $FIXTURE/old_binary_on_failure ]]; then
+    while IFS= read -r target; do rm -f "$target"; done < "$FIXTURE/legacy-targets"
   fi
 fi
 printf '%s\\n' "$*" >> "$FIXTURE/installed"
@@ -122,15 +134,25 @@ fi
         self.stub('nginx', '''#!/bin/bash
 echo "nginx $*" >> "$FIXTURE/commands"
 if [[ $1 == -V ]]; then
-  if [[ -f $FIXTURE/installed && ! -f $FIXTURE/no_builtin_stream && ! -f $FIXTURE/old_binary_on_failure ]]; then
-    echo 'configure arguments: --with-stream --with-stream_ssl_preread_module' >&2
+  if [[ -f $FIXTURE/installed && ! -f $FIXTURE/old_binary_on_failure ]]; then
+    if [[ -f $FIXTURE/wrong_binary_version ]]; then
+      echo 'nginx version: nginx/1.29.0' >&2
+    else
+      version=$(cat "$FIXTURE/candidate"); version=${version#*:}; version=${version%%-*}
+      echo "nginx version: nginx/$version" >&2
+    fi
+    build='configure arguments:'
+    if [[ ! -f $FIXTURE/no_builtin_stream ]]; then build+=' --with-stream --with-stream_ssl_preread_module'; fi
+    if [[ ! -f $FIXTURE/no_builtin_mail ]]; then build+=' --with-mail --with-mail_ssl_module'; fi
+    echo "$build" >&2
   else
+    echo 'nginx version: nginx/1.28.0 (Ubuntu)' >&2
     echo 'configure arguments: --with-stream=dynamic --with-stream_ssl_preread_module' >&2
   fi
   exit 0
 fi
 if [[ $1 == -T ]]; then
-  for path in "$FIXTURE/nginx/nginx.conf" "$FIXTURE/nginx"/modules-enabled/*; do
+  for path in "$FIXTURE/nginx/nginx.conf" "$FIXTURE/nginx"/modules-enabled/* "$FIXTURE/nginx"/conf.d/*; do
     [[ -f $path ]] || continue
     printf '# configuration file %s:\\n' "$path"
     cat "$path"
@@ -337,7 +359,7 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
 
     def test_migration_rejects_additional_removals_or_purge(self):
         self.prepare_migration()
-        for removal in ('Remv libnginx-mod-stream-geoip2 [1.28.0]', 'Remv nginx-core [1.28.0]',
+        for removal in ('Remv libnginx-mod-http-lua [1.28.0]', 'Remv nginx-extras [1.28.0]',
                         'Remv unrelated [1.0]', 'Purg nginx-common [1.28.0]'):
             with self.subTest(removal=removal):
                 (self.root / 'migration_plan').write_text('Remv nginx-common [1.28.0]\n' + removal + '\n')
@@ -351,6 +373,129 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
         result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
         self.assertIn('动态模块', result.stderr)
         self.assert_not_installed()
+
+    def prepare_core_migration(self):
+        policy = self.prepare_migration()
+        self.os_release.write_text('ID=ubuntu\nVERSION_CODENAME=jammy\n')
+        self.env['TEST_ARCH'] = 'arm64'
+        (self.root / 'candidate').write_text('1.30.7-1~jammy')
+        (self.root / 'versions').write_text(
+            ' nginx | 1.30.7-1~jammy | https://nginx.org/packages/ubuntu jammy/nginx arm64 Packages\n')
+        modules = {
+            'ngx_http_geoip2_module.so': 'libnginx-mod-http-geoip2',
+            'ngx_http_image_filter_module.so': 'libnginx-mod-http-image-filter',
+            'ngx_http_xslt_filter_module.so': 'libnginx-mod-http-xslt-filter',
+            'ngx_mail_module.so': 'libnginx-mod-mail',
+            'ngx_stream_module.so': 'libnginx-mod-stream',
+            'ngx_stream_geoip2_module.so': 'libnginx-mod-stream-geoip2',
+        }
+        packages = ['nginx-common', 'nginx-core', *modules.values()]
+        (self.root / 'migration_plan').write_text(''.join(
+            f'Remv {package}:arm64 [1.18.0-6ubuntu14.22]\n' for package in packages) +
+            'Inst nginx [1.18.0-6ubuntu14.22] (1.30.7-1~jammy nginx:stable [arm64])\n')
+        loaders = []
+        targets = []
+        for module in modules:
+            target = self.root / f'{module}.conf'
+            target.write_text(f'# keep loader comment\nload_module modules/{module};\n')
+            loader = self.nginx / 'modules-enabled' / f'{module}.conf'
+            loader.symlink_to(target)
+            loaders.append(loader)
+            targets.append(target)
+        (self.root / 'legacy-targets').write_text(''.join(f'{target}\n' for target in targets))
+        return policy, loaders, targets, packages
+
+    def test_jammy_arm64_core_bundle_migrates_all_eight_packages_without_purge(self):
+        policy, loaders, targets, packages = self.prepare_core_migration()
+        original = self.config.read_bytes()
+        policy_before = policy.read_bytes()
+        site = self.nginx / 'sites-available/example.com'
+        site.write_text('user-owned HTTPS site and certificate references\n')
+        (self.nginx / 'sites-enabled/example.com').symlink_to(site)
+        sni = self.nginx / 'npctl-stream'
+        sni.mkdir()
+        (sni / 'nodes.tsv').write_text('node.example.com\t34138\n')
+        self.run_bash('nginx_install_official_package --only-upgrade', input='y\n')
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(site.read_text(), 'user-owned HTTPS site and certificate references\n')
+        self.assertEqual((sni / 'nodes.tsv').read_text(), 'node.example.com\t34138\n')
+        self.assertEqual(policy.read_bytes(), policy_before)
+        self.assertTrue((self.root / 'service_active').exists())
+        for loader, target in zip(loaders, targets):
+            self.assertFalse(target.exists())
+            self.assertFalse(loader.is_symlink())
+            self.assertNotIn('load_module', loader.read_text())
+            self.assertIn('# keep loader comment', loader.read_text())
+        backup, = (self.root / 'backups').iterdir()
+        plan = json.loads((backup / 'module-plan.json').read_text())
+        self.assertEqual(len(plan), 6)
+        self.assertTrue(all('load_module' in item['original'] for item in plan))
+        for package in packages:
+            self.assertIn(package + ':arm64', (backup / 'packages.txt').read_text())
+        self.assertEqual(set((backup / 'approved-removals').read_text().splitlines()),
+                         {f'{package}:arm64' for package in packages})
+        installed = (self.root / 'installed').read_text()
+        self.assertIn('nginx=1.30.7-1~jammy', installed)
+        self.assertIn('APT::Get::Purge=false', installed)
+        self.assertFalse((self.nginx / 'conf.d/default.conf').exists())
+
+    def test_core_bundle_rejects_used_optional_modules_before_backup_or_downtime(self):
+        self.prepare_core_migration()
+        included = self.nginx / 'conf.d/used-module.conf'
+        for directive in ('geoip2 /db.mmdb { $country country iso_code; }',
+                          'geoip2_proxy_recursive on;', 'image_filter resize 100 100;',
+                          'image_filter_jpeg_quality 90;', 'xslt_stylesheet /style.xsl;',
+                          'xslt_types text/xml;', 'xml_entities /entities.dtd;',
+                          '"image_filter" off;'):
+            with self.subTest(directive=directive):
+                included.write_text(directive + '\n')
+                result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+                self.assertIn('配置正在使用动态模块', result.stderr)
+                self.assert_not_installed()
+                self.assertFalse((self.root / 'backups').exists())
+                self.assertNotIn('systemctl stop nginx', self.commands())
+
+    def test_core_bundle_ignores_commented_directives_and_argument_strings(self):
+        self.prepare_core_migration()
+        self.config.write_text('# image_filter resize 100 100;\nevents {}\n'
+                               'http { map $uri $value { default "image_filter"; } }\n')
+        before = self.config.read_bytes()
+        self.run_bash('nginx_install_official_package', input='y\n')
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_core_bundle_rejects_unusual_keyword_spellings(self):
+        self.prepare_core_migration()
+        for keyword in ('image"_filter"', r'image\\_filter', 'load"_module"'):
+            with self.subTest(keyword=keyword):
+                self.config.write_text(f'events {{}}\nhttp {{ {keyword} off; }}\n')
+                result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+                self.assertIn('不支持带转义或拼接的指令名', result.stderr)
+                self.assert_not_installed()
+
+    def test_core_bundle_requires_actual_builtin_mail_in_new_binary(self):
+        _, loaders, _targets, _packages = self.prepare_core_migration()
+        (self.root / 'no_builtin_mail').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('未检测到内置 Mail', result.stderr)
+        self.assertTrue(all(loader.is_symlink() for loader in loaders))
+        self.assertNotIn('systemctl start nginx', self.commands())
+
+    def test_core_bundle_keeps_loaders_if_wrong_binary_is_on_path(self):
+        _, loaders, _targets, _packages = self.prepare_core_migration()
+        (self.root / 'wrong_binary_version').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('版本与官方候选版本不符', result.stderr)
+        self.assertTrue(all(loader.is_symlink() for loader in loaders))
+        self.assertNotIn('systemctl start nginx', self.commands())
+
+    def test_core_bundle_partial_failure_retains_old_loaders_for_old_binary(self):
+        _, loaders, targets, _packages = self.prepare_core_migration()
+        (self.root / 'old_binary_on_failure').touch()
+        (self.root / 'fail_package_install').touch()
+        self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertTrue(all(loader.is_symlink() for loader in loaders))
+        self.assertTrue(all(target.exists() for target in targets))
+        self.assertIn('systemctl start nginx', self.commands())
 
     def prepare_stream_migration(self):
         policy = self.prepare_migration()
@@ -381,7 +526,7 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
         self.assertEqual(policy.read_bytes(), policy_before)
         backup, = (self.root / 'backups').iterdir()
         self.assertEqual((backup / 'nginx/modules-enabled/50-mod-stream.conf').readlink(), target)
-        self.assertTrue((backup / 'stream-module-plan.json').is_file())
+        self.assertTrue((backup / 'module-plan.json').is_file())
 
     def test_stream_loader_in_main_config_is_removed_without_touching_other_text(self):
         self.prepare_migration()
@@ -459,6 +604,15 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
         self.assert_not_installed()
         self.assertNotIn('systemctl stop nginx', self.commands())
 
+    def test_migration_stops_if_config_changes_after_confirmation(self):
+        self.prepare_migration()
+        (self.root / 'change_config_after_download').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('确认后 Nginx 配置发生变化', result.stderr)
+        self.assert_not_installed()
+        self.assertIn('# concurrent edit', self.config.read_text())
+        self.assertNotIn('systemctl stop nginx', self.commands())
+
     def test_migration_install_failure_restores_config_policy_and_service(self):
         policy = self.prepare_migration()
         before = self.config.read_bytes()
@@ -482,6 +636,13 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
         self.assert_not_installed()
         self.assertEqual(self.config.read_bytes(), before)
         self.assertEqual(policy.read_bytes(), policy_before)
+
+    def test_migration_guard_rejects_unconfirmed_known_removal(self):
+        self.prepare_migration()
+        (self.root / 'unexpected_known_removal').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('Unexpected package removal: nginx-core', result.stderr)
+        self.assert_not_installed()
 
     def test_migration_stop_failure_restores_policy_without_installing(self):
         policy = self.prepare_migration()

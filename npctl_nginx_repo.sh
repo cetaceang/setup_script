@@ -80,11 +80,20 @@ EOF
   echo "已配置 Nginx 官方 stable 源: $distro / $codename / $arch"
 )
 
+nginx_migration_removal_packages() {
+  # Only the reviewed Ubuntu core bundle; do not accept arbitrary nginx-* or
+  # libnginx-mod-* packages (third-party modules have their own ABI/features).
+  printf '%s\n' nginx-common nginx-core libnginx-mod-stream libnginx-mod-mail \
+    libnginx-mod-http-geoip2 libnginx-mod-stream-geoip2 \
+    libnginx-mod-http-image-filter libnginx-mod-http-xslt-filter
+}
+
 nginx_migration_plan_allowed() {
-  awk '
+  awk -v packages="$(nginx_migration_removal_packages)" '
+    BEGIN { count=split(packages, names, "\n"); for (i=1; i<=count; i++) allowed[names[i]]=1 }
     $1 == "Remv" {
       name=$2; sub(/:.*/, "", name); removed=1
-      if (name != "nginx-common" && name != "libnginx-mod-stream") bad=1
+      if (!(name in allowed)) bad=1
     }
     $1 == "Purg" { bad=1 }
     END { exit !(removed && !bad) }
@@ -98,9 +107,28 @@ nginx_has_builtin_stream() {
     grep -Eq '(^|[[:space:]])--with-stream_ssl_preread_module([[:space:]]|$)' <<<"$build"
 }
 
+nginx_migration_binary_ready() {
+  local candidate=$1 needs_stream=$2 needs_mail=$3 build version
+  version=${candidate#*:}; version=${version%%-*}
+  build=$(nginx -V 2>&1) || return 1
+  grep -Fxq "nginx version: nginx/$version" <<<"$build" || {
+    warn '磁盘上的 Nginx 版本与官方候选版本不符，不修改旧模块加载指令。'; return 1;
+  }
+  if [[ $needs_stream == 1 ]] && ! nginx_has_builtin_stream; then
+    warn '安装后的 Nginx 未检测到内置 Stream / ssl_preread，停止迁移并保留备份。'; return 1
+  fi
+  if [[ $needs_mail == 1 ]] && ! {
+    grep -Eq '(^|[[:space:]])--with-mail([[:space:]]|$)' <<<"$build" &&
+      grep -Eq '(^|[[:space:]])--with-mail_ssl_module([[:space:]]|$)' <<<"$build"
+  }; then
+    warn '安装后的 Nginx 未检测到内置 Mail / SSL，停止迁移并保留备份。'; return 1
+  fi
+}
+
 nginx_migrate_common_package() (
-  local candidate=$1 plan=$2 answer backup='' dump was_active=0 stopped=0
-  local parser="${BASH_SOURCE[0]%/*}/npctl_stream_config.py" module_plan needs_stream=0
+  local candidate=$1 plan=$2 answer backup='' dump current_dump was_active=0 stopped=0
+  local parser="${BASH_SOURCE[0]%/*}/npctl_stream_config.py" module_plan needs_stream=0 needs_mail=0
+  local -a removed_packages=()
   local policy=/usr/sbin/policy-rc.d had_policy=0 installed_policy=0 attempted=0 restored=0
   shift 2
   nginx_migration_plan_allowed <<<"$plan" || { warn '迁移计划包含不支持的软件包删除。'; return 1; }
@@ -111,11 +139,15 @@ nginx_migrate_common_package() (
   [[ -d /etc/nginx && ! -L /etc/nginx ]] || { warn '迁移仅支持普通 /etc/nginx 目录。'; return 1; }
   nginx -t || return 1
   dump=$(nginx -T) || return 1
-  module_plan=$(python3 "$parser" stream-module-plan <(printf '%s\n' "$dump") /etc/nginx) || return 1
-  if [[ $module_plan != '[]' ]] || grep -Eq '^Remv libnginx-mod-stream( |:)' <<<"$plan"; then needs_stream=1; fi
+  module_plan=$(python3 "$parser" nginx-module-plan <(printf '%s\n' "$dump") /etc/nginx) || return 1
+  if grep -Fq '"ngx_stream_module.so"' <<<"$module_plan" ||
+      grep -Eq '^Remv libnginx-mod-stream( |:)' <<<"$plan"; then needs_stream=1; fi
+  if grep -Fq '"ngx_mail_module.so"' <<<"$module_plan" ||
+      grep -Eq '^Remv libnginx-mod-mail( |:)' <<<"$plan"; then needs_mail=1; fi
   printf '%s\n' "$plan"
-  warn '将替换发行版 nginx，仅允许移除 nginx-common / libnginx-mod-stream（不 purge）。'
-  warn '完整备份并恢复原配置；旧 Stream 加载指令将替换为官方内置模块，网站及 SNI 映射保留。'
+  warn '将受控替换发行版 nginx-common / nginx-core 及计划内的已知旧模块（不 purge）。'
+  warn 'Stream / Mail 改用官方内置模块；GeoIP2 / 图像过滤 / XSLT 仅在实际加载配置未使用时移除。'
+  warn '完整备份并恢复原配置，仅调整旧模块加载指令；网站及 SNI 映射保留。'
   warn '迁移会短暂停止 Nginx；若安装失败，软件包版本不会自动回滚。'
   read -r -p '确认迁移到官方 Nginx？[y/N]: ' answer || return 1
   case "$answer" in y|Y|yes|YES) ;; *) echo '已取消迁移，未修改软件包。'; return 1 ;; esac
@@ -131,10 +163,11 @@ nginx_migrate_common_package() (
     fi
     mkdir -p /etc/nginx || return 1
     cp -a "$backup/nginx/." /etc/nginx/ || return 1
-    # Also works after a partial package failure: adapt loaders only when the
-    # binary actually on disk has built-in Stream. Otherwise retain originals.
-    if [[ $module_plan != '[]' ]] && nginx_has_builtin_stream; then
-      python3 "$parser" stream-module-apply "$backup/stream-module-plan.json" /etc/nginx || return 1
+    # On partial package failure, never adapt loaders for the old binary or
+    # for a binary missing required builtins. Keep the original config then.
+    if [[ $module_plan != '[]' ]] &&
+        nginx_migration_binary_ready "$candidate" "$needs_stream" "$needs_mail" 2>/dev/null; then
+      python3 "$parser" nginx-module-apply "$backup/module-plan.json" /etc/nginx || return 1
     fi
     restored=1
   }
@@ -164,33 +197,38 @@ nginx_migrate_common_package() (
   cp -a /etc/nginx "$backup/nginx" || return 1
   printf '%s\n' "$dump" >"$backup/nginx-T.txt"
   printf '%s\n' "$plan" >"$backup/apt-plan.txt"
-  printf '%s\n' "$module_plan" >"$backup/stream-module-plan.json" || return 1
-  dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' nginx nginx-common >"$backup/packages.txt" || return 1
-  if [[ $needs_stream == 1 ]]; then
-    dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' libnginx-mod-stream >>"$backup/packages.txt" || true
-  fi
+  printf '%s\n' "$module_plan" >"$backup/module-plan.json" || return 1
+  awk '$1 == "Remv" { print $2 }' <<<"$plan" >"$backup/approved-removals" || return 1
+  mapfile -t removed_packages <"$backup/approved-removals"
+  dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' nginx "${removed_packages[@]}" \
+    >"$backup/packages.txt" || return 1
   echo "迁移备份: $backup"
 
-  # Enforce the removal allowlist inside APT's transaction, not just in a
-  # prior simulation. Abort before dpkg if the dependency plan has changed.
+  # Permit only removals from the CONFIRMED simulation, not the entire general
+  # allowlist. Even a newly added known module removal must abort before dpkg.
   cat >"$backup/guard-removals" <<'EOF'
 #!/bin/sh
 awk '
-  NR == 1 { if ($0 != "VERSION 2") exit 1; next }
+  NR == FNR { name=$1; sub(/:.*/, "", name); allowed[name]=1; next }
+  FNR == 1 { if ($0 != "VERSION 2") exit 1; next }
   !actions && $0 == "" { actions=1; next }
   actions && $5 == "**REMOVE**" {
     name=$1; sub(/:.*/, "", name)
-    if (name != "nginx-common" && name != "libnginx-mod-stream") {
+    if (!(name in allowed)) {
       print "Unexpected package removal: " $1 > "/dev/stderr"; exit 1
     }
   }
   END { if (!actions) exit 1 }
-'
+' "${0%/*}/approved-removals" -
 EOF
   chmod 0700 "$backup/guard-removals" || return 1
   # Finish all downloads before introducing any service downtime.
   DEBIAN_FRONTEND=noninteractive apt-get --download-only -y -o APT::Get::Purge=false \
     install "$@" "nginx=$candidate" || return 1
+  current_dump=$(nginx -T) || return 1
+  [[ $current_dump == "$dump" ]] || {
+    warn '确认后 Nginx 配置发生变化，未停止服务或安装软件包；请重试迁移。'; return 1;
+  }
 
   if [[ -e $policy || -L $policy ]]; then
     if [[ -x $policy ]]; then cp -Lp "$policy" "$backup/delegate-policy" || return 1; fi
@@ -217,10 +255,7 @@ EOF
     -o "DPkg::Tools::Options::$backup/guard-removals::Version=2" \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     install -y "$@" "nginx=$candidate" || return 1
-  if [[ $needs_stream == 1 ]] && ! nginx_has_builtin_stream; then
-    warn '安装后的 Nginx 未检测到内置 Stream / ssl_preread，停止迁移并保留备份。'
-    return 1
-  fi
+  nginx_migration_binary_ready "$candidate" "$needs_stream" "$needs_mail" || return 1
   restore_migration_config || return 1
   systemctl daemon-reload || return 1
   nginx -t || return 1
@@ -248,14 +283,14 @@ nginx_install_official_package() {
   fi
   echo "Nginx 官方 stable 候选版本: $candidate"
   if ! apt-get -s --no-remove install "$@" "nginx=$candidate"; then
-    echo '检测到软件包冲突，检查是否仅需受控替换 nginx-common / libnginx-mod-stream。'
+    echo '检测到软件包冲突，检查发行版 Nginx 核心包及旧模块的受控迁移计划。'
     plan=$(LC_ALL=C apt-get -s -o APT::Get::Purge=false install "$@" "nginx=$candidate") || return 1
     if nginx_migration_plan_allowed <<<"$plan"; then
       nginx_migrate_common_package "$candidate" "$plan" "$@"
       return $?
     fi
     printf '%s\n' "$plan"
-    warn 'APT 计划不满足自动迁移白名单（仅 nginx-common / libnginx-mod-stream），已展示完整计划。'
+    warn 'APT 计划包含受控迁移范围外的软件包删除或 purge，已展示完整计划。'
     warn '未删除任何软件包；请先备份 /etc/nginx，手动处理旧包和动态模块兼容性后重试，勿直接 purge 配置。'
     return 1
   fi

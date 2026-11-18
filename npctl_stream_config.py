@@ -229,8 +229,23 @@ def probe(dump_path, allowed_paths, managed_stream):
                     raise ValueError(f'不明配置占用本地 HTTPS 8443，停止操作: {name}')
 
 
-def stream_module_plan(dump_path, config_root):
-    """Plan only Stream loader edits; never modify a loaded module's target."""
+LEGACY_MODULES = {
+    'ngx_stream_module.so': (),
+    'ngx_mail_module.so': (),
+    'ngx_http_geoip2_module.so': ('geoip2',),
+    'ngx_stream_geoip2_module.so': ('geoip2',),
+    'ngx_http_image_filter_module.so': ('image_filter',),
+    'ngx_http_xslt_filter_module.so': ('xslt_', 'xml_entities'),
+}
+
+
+def stream_module_plan(dump_path, config_root, *, legacy=False):
+    """Plan builtin/unused distro loader edits; never modify link targets.
+
+    Stream and Mail require runtime builtin checks in the package migrator.
+    Optional filters/GeoIP2 may only be unloaded if no loaded configuration
+    uses their directives. Unknown modules and unusual spellings fail closed.
+    """
     root = Path(config_root).resolve()
     sections = {}
     current = None
@@ -243,16 +258,40 @@ def stream_module_plan(dump_path, config_root):
             sections[current] += line
     if not sections:
         raise ValueError('无法解析 nginx -T 的实际模块加载路径')
+    for name, body in sections.items():
+        if Path(name).read_bytes().decode().rstrip('\n') != body.rstrip('\n'):
+            raise ValueError(f'配置在 nginx -T 后发生变化，或无法识别配置分隔符，请重试: {name}')
+    supported = LEGACY_MODULES if legacy else {'ngx_stream_module.so': ()}
+    loaded = set()
+    for name, body in sections.items():
+        for parts, delimiter, _, _ in directives(body):
+            keyword = parts[0][0].strip('\"\'')
+            if legacy and any(character in keyword for character in '\\"\''):
+                raise ValueError(f'模块使用检查不支持带转义或拼接的指令名: {name}')
+            if keyword != 'load_module':
+                continue
+            argument = parts[1][0].strip('\"\'') if len(parts) == 2 else ''
+            module = Path(argument).name
+            if (delimiter != ';' or module not in supported or argument not in
+                    (f'modules/{module}', f'/usr/lib/nginx/modules/{module}')):
+                raise ValueError(f'其他或非标准动态模块不自动迁移，请先处理模块 ABI 兼容性: {name}')
+            loaded.add(module)
+    optional = {module: supported[module] for module in loaded if supported[module]}
+    if optional:
+        for name, body in sections.items():
+            for parts, _, _, _ in directives(body):
+                keyword = parts[0][0].strip('\"\'')
+                for module, prefixes in optional.items():
+                    if keyword.startswith(prefixes):
+                        raise ValueError(f'配置正在使用动态模块 {module} ({keyword})，不能自动移除；'
+                                         f'请先准备官方兼容模块或手动迁移此功能: {name}')
     plan = []
     for name, body in sections.items():
         selected = []
-        for parts, delimiter, _, end in directives(body):
+        for parts, _, _, _ in directives(body):
             if parts[0][0].strip('\"\'') != 'load_module':
                 continue
-            if (delimiter != ';' or len(parts) != 2 or parts[1][0].strip('\"\'') not in
-                    ('modules/ngx_stream_module.so', '/usr/lib/nginx/modules/ngx_stream_module.so')):
-                raise ValueError(f'其他或非标准动态模块不自动迁移，请先处理模块 ABI 兼容性: {name}')
-            selected.append((parts[0][1], end))
+            selected.append(Path(parts[1][0].strip('\"\'')).name)
         if not selected:
             continue
         path = Path(os.path.abspath(name))
@@ -268,8 +307,9 @@ def stream_module_plan(dump_path, config_root):
             if delimiter == ';' and parts[0][0].strip('\"\'') == 'load_module':
                 content = content[:parts[0][1]] + content[end:]
         if not content.strip():
-            content = '# Stream / ssl_preread is built into nginx.org packages.\n'
-        plan.append({'path': str(relative), 'content': content,
+            content = '# Distro loaders migrated to nginx.org builtins / unused modules.\n'
+        plan.append({'path': str(relative), 'content': content, 'modules': selected,
+                     'original': original,
                      'sha256': hashlib.sha256(original.encode()).hexdigest(),
                      'link': os.readlink(path) if path.is_symlink() else None})
     return plan
@@ -303,7 +343,7 @@ def apply_stream_module_plan(plan_path, config_root):
             path.chmod(0o644)
         else:
             path.write_bytes(item['content'].encode())
-        print(f'Stream 已改用官方内置模块，移除旧加载指令: {path}')
+        print(f'已移除旧模块加载指令（内置模块 / 未使用模块）: {path}')
 
 
 def main():
@@ -320,10 +360,10 @@ def main():
     listener = sub.add_parser('has-listener')
     listener.add_argument('dump')
     listener.add_argument('port', type=int)
-    module_plan = sub.add_parser('stream-module-plan')
+    module_plan = sub.add_parser('stream-module-plan', aliases=['nginx-module-plan'])
     module_plan.add_argument('dump')
     module_plan.add_argument('root')
-    module_apply = sub.add_parser('stream-module-apply')
+    module_apply = sub.add_parser('stream-module-apply', aliases=['nginx-module-apply'])
     module_apply.add_argument('plan')
     module_apply.add_argument('root')
     args = parser.parse_args()
@@ -332,9 +372,10 @@ def main():
             migrate(args.paths, args.metadata, args.direction == 'enable')
         elif args.command == 'has-listener':
             print('yes' if has_listener(args.dump, args.port) else 'no')
-        elif args.command == 'stream-module-plan':
-            print(json.dumps(stream_module_plan(args.dump, args.root)))
-        elif args.command == 'stream-module-apply':
+        elif args.command in ('stream-module-plan', 'nginx-module-plan'):
+            print(json.dumps(stream_module_plan(args.dump, args.root,
+                                               legacy=args.command == 'nginx-module-plan')))
+        elif args.command in ('stream-module-apply', 'nginx-module-apply'):
             apply_stream_module_plan(args.plan, args.root)
         else:
             probe(args.dump, args.paths, args.managed_stream)

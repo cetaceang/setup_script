@@ -11,7 +11,11 @@
 - 首次安装以及 `sudo npctl` → **4. 更新 nginx** 使用 **nginx.org stable 官方源**，支持 Debian / Ubuntu 的 `amd64`、`arm64`；发行代号必须仍由官方源提供。不添加 PPA，不从源码编译。
 - 自动下载并校验官方签名密钥，以 `signed-by` 限定信任范围，写入 `/usr/share/keyrings/nginx-archive-keyring.gpg`、`/etc/apt/sources.list.d/nginx.list` 和 `/etc/apt/preferences.d/99nginx`（优先级 900）。同名文件会更新为 stable 配置，其他软件源不改动；候选版本必须能在官方 stable 源中找到，否则停止，不回退到发行版源或 mainline。
 - **选项 9 只更新 npctl、补齐缺失依赖，不自动升级已安装的 Nginx 或切换其来源**；缺少 Nginx 时才从官方源安装。要切换/升级 Nginx，请随后使用 npctl 选项 4。升级前后均检查配置，保留已有 `nginx.conf`、站点、证书和 SNI 文件，APT 遇到配置文件冲突时保留本地版本。
-- **支持 `nginx-common` / `libnginx-mod-stream` 的受控迁移**：先展示 APT 计划，输入 `y` 确认后，将整个 `/etc/nginx`、实际加载配置、Stream 加载器修改计划及软件包清单备份至 `/var/backups/npctl/nginx-migration-*`。预下载完成后短暂停服，临时禁止软件包自动启动 Nginx，仅允许移除这两个旧包（不 purge），APT 事务钩子再次检查删除白名单。恢复原配置目录后，确认新内核确实内置 Stream / `ssl_preread`，再只移除实际加载的 `ngx_stream_module.so` 加载指令；原加载链接改为同路径的普通配置文件，避免链接目标随旧包移除而失效，也兼容显式 `include`。网站、证书引用、SNI 监听和映射保持原样，不保留官方新增的默认站点。最终 `nginx -t` 通过才恢复原来运行的服务，并还原系统服务策略。默认取消；其他动态模块、非标准模块路径，或需要删除 `nginx-core`、其他软件包时仍停止并展示实际 APT 计划。失败时保留备份并尝试恢复原配置及服务，**不会自动回滚软件包版本**。其他源重复定义 nginx.org、设置更高优先级或已安装版本高于 stable 时，也需先手动处理。
+- **支持 Ubuntu `nginx-core` 旧包组合的受控迁移**：删除白名单限定为 `nginx-common`、`nginx-core`、`libnginx-mod-stream`、`libnginx-mod-mail`、`libnginx-mod-http-geoip2`、`libnginx-mod-stream-geoip2`、`libnginx-mod-http-image-filter`、`libnginx-mod-http-xslt-filter`，不泛化允许 `nginx-*` / `libnginx-mod-*`。
+  - 根据 `nginx -T` 检查实际加载的模块及配置。Stream / Mail 加载器可改用官方内置模块；GeoIP2、图像过滤、XSLT **仅在实际加载配置没有使用其指令时**允许移除加载器。正在使用这些功能、其他动态模块、非标准模块路径或其他旧核心包（如 `nginx-extras`）时停止，需先准备版本匹配的官方模块或手动迁移功能；不会静默删去功能配置或自动安装替代模块。
+  - 先展示 APT 计划，输入 `y` 确认后，将整个 `/etc/nginx`、实际加载配置、模块修改计划（含加载器原内容）、本次批准的删除清单、Nginx 及所有待移除软件包版本备份至 `/var/backups/npctl/nginx-migration-*`。默认取消，不 purge、不 autoremove；预下载完成后复查配置未变化，再短暂停服并临时禁止软件包自动启动 Nginx。APT 事务钩子仅允许**已确认计划中**的删除项，即使新增项仍在一般白名单中也会拦截。
+  - 恢复原配置目录后，确认磁盘上的 Nginx 版本与候选版本一致，且所需 Stream / `ssl_preread`、Mail / SSL 确实内置，再仅移除旧模块的加载指令。原加载链接改为同路径普通配置文件，避免目标随旧包移除而失效，也兼容显式 `include`。网站、证书引用、SNI 监听和映射保持原样，不保留官方新增的默认站点。最终 `nginx -t` 通过才恢复原来运行的服务，并还原系统服务策略。失败时保留备份并尝试恢复原配置及服务，**不会自动回滚软件包版本**。
+  - 如果旧版 npctl 报“仅 nginx-common / libnginx-mod-stream”白名单错误，先用完整新版仓库运行 `sudo bash setup.sh` → **9. 安全更新 npctl**，再运行 `sudo npctl` → **4. 更新 nginx**。其他源重复定义 nginx.org、设置更高优先级或已安装版本高于 stable 时，也需先手动处理。
 - 官方包已内置 Stream / `ssl_preread`，不与发行版 `libnginx-mod-stream` 混装。首次安装会移除官方包的 `conf.d/default.conf`，改用本工具的 ACME 默认站点；安全更新不删除已有默认站点。
 
 源与密钥说明：[nginx.org 官方安装文档](https://nginx.org/en/linux_packages.html)。
@@ -107,8 +111,8 @@ sudo certbot renew --dry-run
 仓库的隔离自动测试：
 
 ```bash
-for script in setup.sh nginx_proxy_control.sh npctl_stream.sh; do bash -n "$script" || exit 1; done
-shellcheck --severity=warning --extended-analysis=false setup.sh nginx_proxy_control.sh npctl_stream.sh
+for script in setup.sh nginx_proxy_control.sh npctl_stream.sh npctl_nginx_repo.sh; do bash -n "$script" || exit 1; done
+shellcheck --severity=warning --extended-analysis=false setup.sh nginx_proxy_control.sh npctl_stream.sh npctl_nginx_repo.sh
 python3 -m unittest discover -s tests -v
 ```
 
