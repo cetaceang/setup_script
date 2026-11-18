@@ -579,6 +579,7 @@ stream_select_node_mode() {
 stream_node_instructions() {
   local domain=$1 mode=$2
   echo "客户端: server=$domain, port=443, servername=$domain"
+  echo '多线路共用一个 REALITY 入站时，server 可填各线路机 IP 或入口域名，servername 保持为该入站的 SNI。'
   if [[ $mode == relay ]]; then
     echo '纯中转：本机只透传 TCP，请保留 direct 到落地机 VLESS 的转发规则。'
     echo 'REALITY handshake 应由落地机设置；仅当 HTTPS 回落也在落地机时，才使用落地机的 127.0.0.1:8443。'
@@ -586,7 +587,7 @@ stream_node_instructions() {
   else
     echo 'REALITY 与 HTTPS 回落在本机时，请在 sing-box 管理脚本中自行设置 handshake: 127.0.0.1:8443。'
   fi
-  echo '域名需解析到本机；Cloudflare 应使用仅 DNS（灰云），本工具不修改 DNS。'
+  echo '客户端 server 使用的域名需解析到对应入口机；Cloudflare 应使用仅 DNS（灰云），本工具不修改 DNS。'
 }
 
 stream_validate_node() {
@@ -597,8 +598,11 @@ stream_validate_node() {
   [[ -f $NPCTL_STREAM_DIR/nodes.tsv ]] || return 0
   while IFS=$'\t' read -r existing_domain existing_port; do
     [[ ! $replacing_domain || $existing_domain != "$replacing_domain" ]] || continue
-    if [[ $domain == "$existing_domain" || $port == "$existing_port" ]]; then
-      warn 'SNI 或节点本地端口已被其他映射使用。'; return 1
+    # SNI is the routing key; multiple names may share one listening backend.
+    if [[ $domain == "$existing_domain" ]]; then
+      warn "SNI $domain 已映射到本机 127.0.0.1:$existing_port；同一台机器上每个 SNI 只能有一条映射。"
+      warn '多条线路共用同一个 SNI 时无需重复添加；修改已有端口请使用菜单 5 → 7。'
+      return 1
     fi
   done <"$NPCTL_STREAM_DIR/nodes.tsv"
 }
@@ -632,7 +636,7 @@ stream_add_node() {
   read -r -p '节点 SNI 域名（留空取消）: ' domain || return 1
   [[ $domain ]] || { echo '已取消添加节点。'; return 0; }
   domain=${domain,,}
-  read -r -p '节点本地监听端口: ' port || return 1
+  read -r -p '节点本地监听端口（不同 SNI 可共用）: ' port || return 1
   stream_validate_node "$domain" "$port" || return 1
   stream_select_node_mode || return 1
   mode=$STREAM_NODE_MODE

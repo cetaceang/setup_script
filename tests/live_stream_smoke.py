@@ -101,7 +101,8 @@ def main():
                     raise AssertionError('certificate must not cover an unrelated domain')
             else:
                 assert b'node-one' in request('node1.example.com')
-                assert b'node-two' in request('node2.example.com')
+                expected = b'node-one' if mode == 'shared-backend' else b'node-two'
+                assert expected in request('node2.example.com')
                 if mode == 'relay':
                     for port in (80, 8443):
                         try:

@@ -454,13 +454,45 @@ ln -s "$NGINX_SITES_AVAILABLE_DIR/{domain}" "$NGINX_SITES_ENABLED_DIR/{domain}"
         self.assertTrue((self.cert / 'live/example.com/fullchain.pem').exists())
         self.assertNotIn('node1.example.com', (self.stream / 'nodes.tsv').read_text())
 
-    def test_duplicate_invalid_and_reserved_nodes_rejected(self):
+    def test_duplicate_sni_invalid_and_reserved_nodes_rejected(self):
         self.enable()
         self.add('node1.example.com', 34138)
-        for domain, port in [('node1.example.com', '39149'), ('node2.example.com', '34138'),
+        for domain, port in [('node1.example.com', '39149'), ('node1.example.com', '34138'),
                              ('x;bad.example.com', '39149'), ('node2.example.com', '8443'),
                              ('node2.example.com', '000443'), ('node2.example.com', '999999999999999999')]:
             self.run_bash(f'stream_validate_node "{domain}" "{port}"', success=False)
+
+    def test_multiple_snis_share_one_landing_backend_and_delete_independently(self):
+        self.run_bash('stream_add_node', input='node1.example.com\n34138\n1\ny\ny\n')
+        self.run_bash('stream_add_node', input='node2.example.com\n34138\n1\ny\n')
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(),
+                         'node1.example.com\t34138\nnode2.example.com\t34138\n')
+        result = self.run_bash('stream_show_nodes')
+        for domain in ('node1.example.com', 'node2.example.com'):
+            self.assertIn(f'{domain} → 127.0.0.1:34138 | 同机回落', result.stdout)
+            self.assertTrue((self.enabled / domain).exists())
+        self.assertEqual((self.stream / 'stream.conf').read_text().count('server 127.0.0.1:34138;'), 2)
+        before = {p: p.read_bytes() for p in self.stream.iterdir()}
+        result = self.run_bash('stream_add_node', input='node1.example.com\n39149\n', success=False)
+        self.assertIn('SNI node1.example.com 已映射到本机 127.0.0.1:34138', result.stderr)
+        for path, data in before.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.run_bash('stream_transaction stream_do_delete_node node1.example.com')
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(), 'node2.example.com\t34138\n')
+        self.assertIn('server 127.0.0.1:34138;', (self.stream / 'stream.conf').read_text())
+        self.assertTrue((self.enabled / 'node2.example.com').exists())
+
+    def test_relay_snis_can_share_one_direct_backend(self):
+        self.remove_all_sites()
+        shutil.rmtree(self.cert)
+        (self.bin / 'certbot').unlink()
+        self.add_relay('node1.example.com', 34138)
+        self.add_relay('node2.example.com', 34138)
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(),
+                         'node1.example.com\t34138\nnode2.example.com\t34138\n')
+        self.assertEqual((self.stream / 'node-modes.tsv').read_text(),
+                         'node1.example.com\trelay\nnode2.example.com\trelay\n')
+        self.assertFalse(list(self.available.iterdir()))
 
     def test_edit_node_port_preserves_sites_certificates_and_other_mappings(self):
         self.enable()
@@ -479,16 +511,30 @@ ln -s "$NGINX_SITES_AVAILABLE_DIR/{domain}" "$NGINX_SITES_ENABLED_DIR/{domain}"
         for path, data in unchanged.items():
             self.assertEqual(path.read_bytes(), data)
 
-    def test_edit_node_port_rejects_invalid_reserved_and_duplicate_ports(self):
+    def test_edit_node_port_rejects_invalid_and_reserved_ports(self):
         self.enable()
         self.add('node1.example.com', 39149)
         self.add('node2.example.com', 34138)
         before = {p: p.read_bytes() for p in self.stream.iterdir()}
-        for port in ('0', '65536', '0080', '80', '443', '8443', '34138', 'not-a-port'):
+        for port in ('0', '65536', '0080', '80', '443', '8443', 'not-a-port'):
             with self.subTest(port=port):
                 self.run_bash('stream_change_node_port', input=f'node1.example.com\n{port}\n', success=False)
                 for path, data in before.items():
                     self.assertEqual(path.read_bytes(), data)
+
+    def test_edit_node_port_can_share_and_leave_an_existing_backend(self):
+        self.enable()
+        self.add('node1.example.com', 39149)
+        self.add_relay('node2.example.com', 34138)
+        modes = (self.stream / 'node-modes.tsv').read_bytes()
+        self.run_bash('stream_change_node_port', input='node1.example.com\n34138\ny\n')
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(),
+                         'node1.example.com\t34138\nnode2.example.com\t34138\n')
+        self.run_bash('stream_change_node_port', input='node1.example.com\n52347\ny\n')
+        self.assertEqual((self.stream / 'nodes.tsv').read_text(),
+                         'node1.example.com\t52347\nnode2.example.com\t34138\n')
+        self.assertEqual((self.stream / 'node-modes.tsv').read_bytes(), modes)
+        self.assertIn('server 127.0.0.1:34138;', (self.stream / 'stream.conf').read_text())
 
     def test_edit_node_port_uses_each_user_supplied_port(self):
         self.enable()
@@ -842,6 +888,14 @@ if [[ $1 == -s ]]; then echo 'Inst libnginx-mod-stream (test)'; exit 0; fi
         self.assertFalse(list(self.available.iterdir()))
         self.assertNotIn('ssl_certificate', (self.stream / 'stream.conf').read_text())
         self.run_live_smoke('relay')
+
+    @unittest.skipUnless(os.environ.get('NPCTL_TEST_NETNS') == '1' and os.environ.get('NPCTL_TEST_NGINX'),
+                         'requires unpacked nginx and sudo unshare -n')
+    def test_live_multiple_snis_route_to_one_backend(self):
+        self.enable()
+        self.add('node1.example.com', 34138)
+        self.add('node2.example.com', 34138)
+        self.run_live_smoke('shared-backend')
 
     @unittest.skipUnless(os.environ.get('NPCTL_TEST_NETNS') == '1' and os.environ.get('NPCTL_TEST_NGINX'),
                          'requires unpacked nginx and sudo unshare -n')

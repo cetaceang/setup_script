@@ -44,7 +44,7 @@ Stream 没有终止客户端 TLS。此模式不使用 PROXY protocol，也不伪
 | `node2.cetaceang.de` | `127.0.0.1:39149` |
 | `blog.cetaceang.de` / 其他 SNI | `127.0.0.1:8443` |
 
-映射拒绝重复 SNI、重复本地端口、不合法域名及 80/443/8443 循环目标。**同机模式**会复用该域名已有的 npctl 网站；没有网站时提供创建独立静态 HTTPS 回落网站的选项，可以取消而不创建映射。首先复用有效且覆盖 SNI 的本机证书，包括 Cloudflare 通配证书；缺少证书时进入现有证书选择/申请流程，可使用 Webroot 或 Cloudflare DNS。证书必须未过期并覆盖该 SNI，不能跳过验证。**纯中转模式**跳过该域名的本机网站和证书流程，只添加 SNI 映射；对应的 HTTPS 回落由运行 REALITY 的落地机提供。
+映射拒绝同机重复 SNI、不合法域名及 80/443/8443 循环目标，**允许不同 SNI 共用同一个本地后端端口**，同机与纯中转模式均支持。不同机器上的映射各自独立，可以使用相同 SNI 或本地端口。**同机模式**会复用该域名已有的 npctl 网站；没有网站时提供创建独立静态 HTTPS 回落网站的选项，可以取消而不创建映射。首先复用有效且覆盖 SNI 的本机证书，包括 Cloudflare 通配证书；缺少证书时进入现有证书选择/申请流程，可使用 Webroot 或 Cloudflare DNS。证书必须未过期并覆盖该 SNI，不能跳过验证。**纯中转模式**跳过该域名的本机网站和证书流程，只添加 SNI 映射；对应的 HTTPS 回落由运行 REALITY 的落地机提供。
 
 节点域名应解析到公网入口 VPS。Cloudflare 需为 **仅 DNS（灰云）**。以下示例适用于 REALITY 和 HTTPS 回落在同一台机器的情况，请在独立的 sing-box 管理脚本中自行设置：
 
@@ -73,9 +73,49 @@ Stream 没有终止客户端 TLS。此模式不使用 PROXY protocol，也不伪
 
 本地专用站点含 `# Managed by npctl local-only HTTPS fallback` 标记；启用、禁用 SNI 时始终保留本地 8443。已有同域名普通网站不会被该入口强制转换或覆盖。独立的落地机未登记本机 SNI 映射时，npctl 无法知道该站点是否正被 sing-box 使用，删除或禁用前请自行确认。
 
+### 两台线路机共用落地机：保留一个 sing-box 节点
+
+已有 sing-box REALITY 节点只能设置一个 SNI 时，推荐保留该节点，让两条线路共用它。**客户端连接地址 `server` 和 TLS `servername` 可以不同**：两个入口域名分别解析到两台线路机，TLS 使用共同的 REALITY SNI，例如 `node.example.com`。
+
+| 客户端配置 | 线路一 | 线路二 |
+| --- | --- | --- |
+| `server` | `line1.example.com`（线路机 A） | `line2.example.com`（线路机 B） |
+| `port` | `443` | `443` |
+| `servername` | `node.example.com` | `node.example.com` |
+
+两台线路机分别在菜单 **5 → 2** 添加 **`node.example.com`**，选择纯中转，填写各自实际的 direct 本地入口端口。添加的是客户端发送的共同 SNI，无需再为 `line1.example.com`、`line2.example.com` 添加映射。两台机器上的相同 SNI 和端口互不冲突，也不要求把共同 SNI 的 DNS 同时解析到两台机器。
+
+两台 direct 都转发到同一个落地入站。若直接转发到落地机 IP:REALITY 实际端口，落地机无需 Stream 节点映射，只需已有节点对应的本地 HTTPS 回落；若转发到落地机的 Nginx Stream:443，落地机保留共同 SNI 的**一条**映射即可。UUID、公钥、short ID 均使用这个落地入站的实际配置，sing-box 的 SNI 与 handshake 无需因增加线路机而更改。
+
+### 两台线路机共用落地机：使用两个 SNI
+
+确实需要两个不同的 TLS SNI 时，可使用 `line1.example.com` 和 `line2.example.com`，分别解析到两台线路机；Cloudflare 均使用仅 DNS（灰云）。**标准 sing-box 的 REALITY 单个入站使用一个 `tls.server_name`，应为两个 SNI 分别创建两个入站、使用不同端口**，不能把 SNI 列表填入该字段。例如落地机也使用 npctl 的公网 443 分流：
+
+```text
+客户端 → 线路机 A:443 → A 的 direct → 落地机:443 → REALITY:34138
+客户端 → 线路机 B:443 → B 的 direct → 落地机:443 → REALITY:39149
+```
+
+| 配置位置 | SNI | npctl 本地后端 | 部署方式 |
+| --- | --- | --- | --- |
+| 线路机 A | `line1.example.com` | A 上已有的 direct 入口，例如 `127.0.0.1:31001` | 纯中转 |
+| 线路机 B | `line2.example.com` | B 上已有的 direct 入口，例如 `127.0.0.1:31001` | 纯中转 |
+| 落地机 | `line1.example.com` | `127.0.0.1:34138` | 同机 REALITY + 本机 HTTPS 回落 |
+| 落地机 | `line2.example.com` | `127.0.0.1:39149` | 同机 REALITY + 本机 HTTPS 回落 |
+
+两台线路机的 direct 远端都填**落地机实际 IP:443**，避免使用解析到线路机的节点域名造成回环。每台机器分别使用菜单 **5 → 2** 添加表中属于自己的映射；本地后端端口应填写该机实际存在的入口端口。落地机会为两个域名分别复用或创建 HTTPS 回落网站，都监听本机 8443，按 SNI 选择证书和网站。域名解析在线路机时，落地机优先复用有效证书或通过 DNS 验证申请；一张覆盖两个域名的通配证书也可以复用。
+
+在独立的 sing-box 管理工具中，设置 34138 入站的 `tls.server_name=line1.example.com`、39149 入站的 `tls.server_name=line2.example.com`，两个入站的 handshake 都为落地机的 `127.0.0.1:8443`。客户端线路一设置 `server=line1.example.com, port=443, servername=line1.example.com`，线路二相应使用 `line2.example.com`，并分别使用对应入站实际的 UUID、公钥和 short ID。npctl 只配置 Nginx 映射，不会自动修改 REALITY 或 direct。
+
+**后端支持同一入站接受多个 SNI 时**，落地机也可以把 `line1.example.com`、`line2.example.com` 都映射到 `127.0.0.1:34138`；npctl 允许这种配置。需在该 REALITY 实现中允许两个 SNI，回落证书覆盖两个域名。Nginx 支持共享端口，不代表所用 REALITY 实现也支持多个 SNI。
+
+**如果已有 direct 直接转发到落地机 REALITY 端口**，例如 A 转发至落地机 IP:34138、B 转发至落地机 IP:39149，流量会直接进入对应入站，无需在落地机添加 Stream 节点映射。此时按上一节操作，在落地机为两个域名分别创建本地 HTTPS 8443 回落即可；两个回落网站可以共用本地 8443。
+
+若提示 SNI 已映射，先使用 **5 → 3** 查看已有映射，无需为每条线路重复添加同一个 SNI。旧版出现「SNI 或节点本地端口已被其他映射使用」时，请先用完整仓库执行 `sudo bash setup.sh` → **9. 安全更新 npctl**，再添加不同 SNI、相同端口的映射。
+
 ### 修改已有节点的后端端口
 
-菜单 **5 → 7. 修改节点后端端口**，输入已有 SNI 及新端口，例如将 `node1.cetaceang.de` 的 `39149` 改为 `34138`。工具保留 SNI、证书、回落网站和其他映射，备份后生成新的 Stream upstream，只有校验通过才重载；失败自动恢复。新端口不能与其他映射重复，也不能是 80、443 或 8443。SNI 已禁用时也可以修改保留的映射，不会自动启用分流。
+菜单 **5 → 7. 修改节点后端端口**，输入已有 SNI 及新端口，例如将 `node1.cetaceang.de` 的 `39149` 改为 `34138`。工具保留 SNI、证书、回落网站和其他映射，备份后生成新的 Stream upstream，只有校验通过才重载；失败自动恢复。新端口可以与其他 SNI 映射共用，但不能是 80、443 或 8443；更改或删除其中一个映射不会修改其他映射。SNI 已禁用时也可以修改保留的映射，不会自动启用分流。
 
 该操作只更新 Nginx 转发目标，sing-box 的实际入站监听需在其管理脚本中另行修改。公网端口仍为 443，本地 HTTPS 回落仍为 8443；客户端端口和 REALITY handshake 无需因为节点后端端口变化而修改。
 
