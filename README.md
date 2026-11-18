@@ -2,9 +2,19 @@
 
 `setup.sh` 安装 VPS 依赖与 `npctl`；`nginx_proxy_control.sh` 管理网站、证书及 Nginx Stream SNI 分流。本工具不安装、读取、修改或重启 sing-box，不修改 DNS。
 
-更新时请取得完整仓库，然后运行 `sudo bash setup.sh`，选择 **9. 安全更新 npctl**。选项 8 检测到现有 `nginx.conf` 时也改用安全更新；不会重写现有主配置、网站或 SNI 映射。辅助文件 `npctl_stream.sh`、`npctl_stream_config.py` 随管理命令安装到 `/usr/local/lib/npctl/`，不要仅下载单个入口脚本。
+更新时请取得完整仓库，然后运行 `sudo bash setup.sh`，选择 **9. 安全更新 npctl**。选项 8 检测到现有 `nginx.conf` 时也改用安全更新；不会重写现有主配置、网站或 SNI 映射。辅助文件 `npctl_stream.sh`、`npctl_stream_config.py`、`npctl_nginx_repo.sh` 随管理命令安装到 `/usr/local/lib/npctl/`，不要仅下载单个入口脚本。
 
 安全更新先校验原有 Nginx 配置，再从 `nginx -T` 检测实际加载的监听。已有 80 端口监听时，不再补建带 `default_server` 的全局 `conf.d/acme.conf`，保留 Debian/Ubuntu 自带 `sites-enabled/default` 以及第三方默认站点；已有 `acme.conf` 也保持原样。完全没有 80 监听时才补建本工具的 ACME 默认站点。npctl 网站自身的 ACME Webroot snippet 保持不变；使用第三方默认站点为新域名申请 HTTP-01 证书时，需由该站点提供正确的验证目录，或改用 DNS 验证。原配置已无效时停止更新；本轮补齐后校验失败会删除本轮新建文件。
+
+## Nginx 官方软件源
+
+- 首次安装以及 `sudo npctl` → **4. 更新 nginx** 使用 **nginx.org stable 官方源**，支持 Debian / Ubuntu 的 `amd64`、`arm64`；发行代号必须仍由官方源提供。不添加 PPA，不从源码编译。
+- 自动下载并校验官方签名密钥，以 `signed-by` 限定信任范围，写入 `/usr/share/keyrings/nginx-archive-keyring.gpg`、`/etc/apt/sources.list.d/nginx.list` 和 `/etc/apt/preferences.d/99nginx`（优先级 900）。同名文件会更新为 stable 配置，其他软件源不改动；候选版本必须能在官方 stable 源中找到，否则停止，不回退到发行版源或 mainline。
+- **选项 9 只更新 npctl、补齐缺失依赖，不自动升级已安装的 Nginx 或切换其来源**；缺少 Nginx 时才从官方源安装。要切换/升级 Nginx，请随后使用 npctl 选项 4。升级前后均检查配置，保留已有 `nginx.conf`、站点、证书和 SNI 文件，APT 遇到配置文件冲突时保留本地版本。
+- **发行版旧包迁移不会自动完成**：官方包可能与 `nginx-common`、`nginx-core` 及 `libnginx-mod-*` 冲突。脚本先模拟安装并禁止删除软件包，存在冲突即停止。请先备份 `/etc/nginx`，记录已加载模块，手动处理旧包和模块兼容性，再重试；不要直接 `purge` 配置。其他源重复定义 nginx.org、设置更高优先级或已安装版本高于 stable 时，也需先手动处理。
+- 官方包已内置 Stream / `ssl_preread`，不与发行版 `libnginx-mod-stream` 混装。首次安装会移除官方包的 `conf.d/default.conf`，改用本工具的 ACME 默认站点；安全更新不删除已有默认站点。
+
+源与密钥说明：[nginx.org 官方安装文档](https://nginx.org/en/linux_packages.html)。
 
 ## 启用并迁移已有网站
 
@@ -18,7 +28,7 @@
 
 Stream 没有终止客户端 TLS。此模式不使用 PROXY protocol，也不伪造客户端 IP。HTTP 后端将看到本地连接 IP，网站访问日志、`X-Real-IP` / `X-Forwarded-For`、IP ACL、限速、Fail2Ban 的客户端 IP 识别会受影响。启用前请评估已有策略。
 
-Debian/Ubuntu 缺少模块时会安装 `libnginx-mod-stream`，安装前确认不会连带替换 Nginx 软件包；安装期间临时阻止软件包钩子操作 Nginx 服务，结束后恢复原来的系统服务策略。若需要先升级 Nginx，会明确停止并要求先使用更新菜单。模块可用性检查失败时不会迁移网站。
+发行版 Debian/Ubuntu Nginx 缺少模块时会安装 `libnginx-mod-stream`，安装前确认不会连带替换 Nginx 软件包；安装期间临时阻止软件包钩子操作 Nginx 服务，结束后恢复原来的系统服务策略。nginx.org 官方 Nginx 使用内置模块，检查失败时不会安装发行版模块。若需要先升级 Nginx，会明确停止并要求先使用更新菜单。模块可用性检查失败时不会迁移网站。
 
 ## 添加多个 REALITY 节点映射
 

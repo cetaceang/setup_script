@@ -29,6 +29,9 @@ NPCTL_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -f "$NPCTL_HELPER_DIR/npctl_stream.sh" ]; then
   NPCTL_HELPER_DIR=/usr/local/lib/npctl
 fi
+if [ -f "$NPCTL_HELPER_DIR/npctl_nginx_repo.sh" ]; then
+  . "$NPCTL_HELPER_DIR/npctl_nginx_repo.sh"
+fi
 if [ -f "$NPCTL_HELPER_DIR/npctl_stream.sh" ]; then
   . "$NPCTL_HELPER_DIR/npctl_stream.sh"
 else
@@ -2185,6 +2188,8 @@ update_nginx_package() {
 
   check_nginx_environment || return 1
   check_apt_environment || return 1
+  require_command nginx_install_official_package '请使用 setup 选项 9 更新完整 npctl。' || return 1
+  nginx -t || return 1
 
   version_before="$(read_nginx_package_version || true)"
   if [ -n "$version_before" ]; then
@@ -2195,11 +2200,8 @@ update_nginx_package() {
     service_was_active=1
   fi
 
-  log "刷新软件包索引"
-  apt update || return 1
-
-  log "升级 nginx 软件包"
-  DEBIAN_FRONTEND=noninteractive apt install --only-upgrade -y nginx || return 1
+  log "配置 nginx.org 官方 stable 源并升级 nginx（保留现有配置）"
+  nginx_install_official_package --only-upgrade || return 1
 
   version_after="$(read_nginx_package_version || true)"
   if [ -n "$version_after" ]; then
@@ -2363,7 +2365,7 @@ show_menu() {
  1. 创建新的反向代理站点
  2. 证书管理
  3. 站点管理
- 4. 更新 nginx
+ 4. 更新 nginx（官方 stable 源）
  5. SNI 分流管理（Stream / REALITY）
  q. 退出
 ====================================================

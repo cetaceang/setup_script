@@ -13,6 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck openssl mawk gawk
-      - run: for script in setup.sh nginx_proxy_control.sh npctl_stream.sh; do bash -n "$script" || exit 1; done
-      - run: shellcheck --severity=warning --extended-analysis=false setup.sh nginx_proxy_control.sh npctl_stream.sh
+      - run: for script in setup.sh nginx_proxy_control.sh npctl_stream.sh npctl_nginx_repo.sh; do bash -n "$script" || exit 1; done
+      - name: ShellCheck
+        run: |
+          options=(--severity=warning)
+          if shellcheck --help | grep -q -- '--extended-analysis'; then
+            options+=(--extended-analysis=false)
+          fi
+          shellcheck "${options[@]}" setup.sh nginx_proxy_control.sh npctl_stream.sh npctl_nginx_repo.sh
       - run: python3 -m unittest discover -s tests -v

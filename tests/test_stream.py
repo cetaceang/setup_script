@@ -40,7 +40,8 @@ class StreamTests(unittest.TestCase):
                         '/usr/local': str(self.root / 'usr/local'), '/root/.secrets': str(self.root / 'secrets'),
                         '/usr/sbin': str(self.root / 'usr/sbin'), '/run/npctl-stream-module.lock': str(self.root / 'module-lock'),
                         '/var/cache/nginx': str(self.root / 'cache')}
-        for name in ('nginx_proxy_control.sh', 'setup.sh', 'npctl_stream.sh', 'npctl_stream_config.py'):
+        for name in ('nginx_proxy_control.sh', 'setup.sh', 'npctl_stream.sh', 'npctl_stream_config.py',
+                     'npctl_nginx_repo.sh'):
             text = (REPO / name).read_text()
             for old, new in replacements.items():
                 text = text.replace(old, new).replace(old.replace('/', '\\/'), new.replace('/', '\\/'))

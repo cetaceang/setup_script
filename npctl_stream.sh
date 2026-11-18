@@ -138,6 +138,12 @@ stream_module_available() {
 
 stream_ensure_module() {
   stream_module_available && return 0
+  # nginx.org builds Stream / ssl_preread into nginx itself. Distribution
+  # dynamic modules have a different ABI and must not be mixed with it.
+  if dpkg-query -W -f='${Maintainer}' nginx 2>/dev/null | grep -Eq '@(nginx\.com|f5\.com)>'; then
+    warn '官方 Nginx 应内置 Stream / ssl_preread；当前检查失败，请检查 nginx -V 和配置，不安装发行版 libnginx-mod-stream。'
+    return 1
+  fi
   require_command apt '当前仅支持 Debian/Ubuntu 自动安装 Stream 模块。' || return 1
   echo '安装与当前 Nginx 软件包匹配的 libnginx-mod-stream。'
   stream_install_module_package || return 1

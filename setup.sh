@@ -3,6 +3,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/npctl_nginx_repo.sh" ]; then
+  . "$SCRIPT_DIR/npctl_nginx_repo.sh"
+fi
 DOT_DNS="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 8.8.8.8#dns.google 8.8.4.4#dns.google 9.9.9.9#dns.quad9.net"
 PLAIN_DNS="1.1.1.1 8.8.8.8"
 PLAIN_FALLBACK_DNS="9.9.9.9"
@@ -51,7 +54,19 @@ require_command() {
 }
 
 install_packages() {
-  local packages=("$@")
+  local package
+  local packages=()
+
+  for package in "$@"; do
+    if [ "$package" = nginx ]; then
+      require_command nginx_install_official_package '请下载完整仓库（缺少 npctl_nginx_repo.sh）。' || return 1
+      nginx_install_official_package || return 1
+      PACKAGE_INDEX_UPDATED=1
+    else
+      packages+=("$package")
+    fi
+  done
+  [ "${#packages[@]}" -gt 0 ] || return 0
 
   if [ "$PACKAGE_INDEX_UPDATED" -eq 0 ]; then
     apt update || return 1
@@ -145,24 +160,16 @@ ensure_file_if_missing() {
 }
 
 remove_default_nginx_site() {
-  local default_site="/etc/nginx/sites-enabled/default"
-
-  if [ -L "$default_site" ] || [ -f "$default_site" ]; then
-    rm -f "$default_site" || return 1
-    return 0
-  fi
-
-  if [ ! -e "$default_site" ]; then
-    return 0
-  fi
-
-  if [ -d "$default_site" ]; then
-    warn "路径 [$default_site] 已存在但为目录，无法自动删除。"
-    return 1
-  fi
-
-  warn "路径 [$default_site] 已存在但既不是普通文件也不是符号链接，无法自动删除。"
-  return 1
+  local default_site
+  # Only called on a fresh install. Official packages use conf.d/default.conf.
+  for default_site in /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf; do
+    if [ -L "$default_site" ] || [ -f "$default_site" ]; then
+      rm -f "$default_site" || return 1
+    elif [ -e "$default_site" ]; then
+      warn "路径 [$default_site] 已存在但不是普通文件或符号链接，无法自动删除。"
+      return 1
+    fi
+  done
 }
 
 rollback_safe_update_created_files() {
@@ -914,15 +921,17 @@ install_certbot_nginx_deploy_hook() {
 
 install_npctl_command() {
   local helper
-  for helper in npctl_stream.sh npctl_stream_config.py; do
+  for helper in npctl_stream.sh npctl_stream_config.py npctl_nginx_repo.sh; do
     if [ ! -f "$SCRIPT_DIR/$helper" ]; then
       warn "未找到 npctl 辅助文件 [$SCRIPT_DIR/$helper]，未更新管理命令。"
       return 1
     fi
   done
-  bash -n "$NPCTL_SOURCE_SCRIPT" && bash -n "$SCRIPT_DIR/npctl_stream.sh" || return 1
+  bash -n "$NPCTL_SOURCE_SCRIPT" && bash -n "$SCRIPT_DIR/npctl_stream.sh" &&
+    bash -n "$SCRIPT_DIR/npctl_nginx_repo.sh" || return 1
   mkdir -p /usr/local/lib/npctl || return 1
-  install -m 0644 "$SCRIPT_DIR/npctl_stream.sh" "$SCRIPT_DIR/npctl_stream_config.py" /usr/local/lib/npctl/ || return 1
+  install -m 0644 "$SCRIPT_DIR/npctl_stream.sh" "$SCRIPT_DIR/npctl_stream_config.py" \
+    "$SCRIPT_DIR/npctl_nginx_repo.sh" /usr/local/lib/npctl/ || return 1
   if [ ! -f "$NPCTL_SOURCE_SCRIPT" ]; then
     warn "未找到 npctl 源脚本 [$NPCTL_SOURCE_SCRIPT]。"
     return 1
@@ -1056,11 +1065,10 @@ setup_nginx_certbot() {
     safe_update_npctl
     return $?
   fi
-  log "8. 安装并配置 Nginx / Certbot / Cloudflare DNS 插件"
+  log "8. 从官方 stable 源安装 Nginx / Certbot / Cloudflare DNS 插件"
   require_command "systemctl" "当前系统不支持 systemd。" || return 1
 
   install_packages "${NGINX_PACKAGES[@]}" || return 1
-  systemctl enable --now nginx || return 1
 
   mkdir -p /var/cache/nginx/assets_cache || return 1
   chown -R www-data:www-data /var/cache/nginx/assets_cache || return 1
@@ -1069,6 +1077,7 @@ setup_nginx_certbot() {
   chown -R www-data:www-data /var/www/acme || return 1
 
   mkdir -p /etc/nginx/conf.d || return 1
+  mkdir -p /etc/nginx/modules-enabled || return 1
   mkdir -p /etc/nginx/snippets || return 1
   mkdir -p /etc/nginx/sites-available || return 1
   mkdir -p /etc/nginx/sites-enabled || return 1
@@ -1086,6 +1095,7 @@ setup_nginx_certbot() {
   install_npctl_command || return 1
 
   nginx -t || return 1
+  systemctl enable --now nginx || return 1
   systemctl reload nginx || return 1
   echo "证书续期成功后将自动校验并重载 Nginx。"
 }
@@ -1101,7 +1111,7 @@ show_menu() {
  5. 创建新用户并加入 sudo 组
  6. 安装、配置并验证 Docker
  7. 管理 Swap
- 8. 安装并配置 Nginx / Certbot / Cloudflare DNS 插件
+ 8. 安装并配置 Nginx（官方 stable 源）/ Certbot / Cloudflare DNS 插件
  9. 安全更新 npctl 并补齐缺失依赖
  0. 按顺序执行全部
  q. 退出
