@@ -11,7 +11,7 @@
 - 首次安装以及 `sudo npctl` → **4. 更新 nginx** 使用 **nginx.org stable 官方源**，支持 Debian / Ubuntu 的 `amd64`、`arm64`；发行代号必须仍由官方源提供。不添加 PPA，不从源码编译。
 - 自动下载并校验官方签名密钥，以 `signed-by` 限定信任范围，写入 `/usr/share/keyrings/nginx-archive-keyring.gpg`、`/etc/apt/sources.list.d/nginx.list` 和 `/etc/apt/preferences.d/99nginx`（优先级 900）。同名文件会更新为 stable 配置，其他软件源不改动；候选版本必须能在官方 stable 源中找到，否则停止，不回退到发行版源或 mainline。
 - **选项 9 只更新 npctl、补齐缺失依赖，不自动升级已安装的 Nginx 或切换其来源**；缺少 Nginx 时才从官方源安装。要切换/升级 Nginx，请随后使用 npctl 选项 4。升级前后均检查配置，保留已有 `nginx.conf`、站点、证书和 SNI 文件，APT 遇到配置文件冲突时保留本地版本。
-- **支持仅冲突 `nginx-common` 的受控迁移**：先展示 APT 计划，输入 `y` 确认后，将整个 `/etc/nginx`、实际加载配置及软件包清单备份至 `/var/backups/npctl/nginx-migration-*`。预下载完成后短暂停服，临时禁止软件包自动启动 Nginx，仅移除 `nginx-common`（不 purge）并安装官方包；APT 事务钩子再次检查删除白名单。随后完整恢复原配置目录，避免新增 `conf.d/default.conf` 干扰站点，校验通过才恢复原来运行的服务，并还原系统服务策略。默认取消；已加载动态模块，或需要删除 `nginx-core`、`libnginx-mod-*`、其他软件包时仍停止，需手动处理兼容性。失败时保留备份并尝试恢复原配置及服务，**不会自动回滚软件包版本**。其他源重复定义 nginx.org、设置更高优先级或已安装版本高于 stable 时，也需先手动处理。
+- **支持 `nginx-common` / `libnginx-mod-stream` 的受控迁移**：先展示 APT 计划，输入 `y` 确认后，将整个 `/etc/nginx`、实际加载配置、Stream 加载器修改计划及软件包清单备份至 `/var/backups/npctl/nginx-migration-*`。预下载完成后短暂停服，临时禁止软件包自动启动 Nginx，仅允许移除这两个旧包（不 purge），APT 事务钩子再次检查删除白名单。恢复原配置目录后，确认新内核确实内置 Stream / `ssl_preread`，再只移除实际加载的 `ngx_stream_module.so` 加载指令；原加载链接改为同路径的普通配置文件，避免链接目标随旧包移除而失效，也兼容显式 `include`。网站、证书引用、SNI 监听和映射保持原样，不保留官方新增的默认站点。最终 `nginx -t` 通过才恢复原来运行的服务，并还原系统服务策略。默认取消；其他动态模块、非标准模块路径，或需要删除 `nginx-core`、其他软件包时仍停止并展示实际 APT 计划。失败时保留备份并尝试恢复原配置及服务，**不会自动回滚软件包版本**。其他源重复定义 nginx.org、设置更高优先级或已安装版本高于 stable 时，也需先手动处理。
 - 官方包已内置 Stream / `ssl_preread`，不与发行版 `libnginx-mod-stream` 混装。首次安装会移除官方包的 `conf.d/default.conf`，改用本工具的 ACME 默认站点；安全更新不删除已有默认站点。
 
 源与密钥说明：[nginx.org 官方安装文档](https://nginx.org/en/linux_packages.html)。

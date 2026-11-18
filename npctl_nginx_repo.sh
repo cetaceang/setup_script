@@ -82,28 +82,40 @@ EOF
 
 nginx_migration_plan_allowed() {
   awk '
-    $1 == "Remv" { name=$2; sub(/:.*/, "", name); removed=1; if (name != "nginx-common") bad=1 }
+    $1 == "Remv" {
+      name=$2; sub(/:.*/, "", name); removed=1
+      if (name != "nginx-common" && name != "libnginx-mod-stream") bad=1
+    }
     $1 == "Purg" { bad=1 }
     END { exit !(removed && !bad) }
   '
 }
 
+nginx_has_builtin_stream() {
+  local build
+  build=$(nginx -V 2>&1) || return 1
+  grep -Eq '(^|[[:space:]])--with-stream([[:space:]]|$)' <<<"$build" &&
+    grep -Eq '(^|[[:space:]])--with-stream_ssl_preread_module([[:space:]]|$)' <<<"$build"
+}
+
 nginx_migrate_common_package() (
   local candidate=$1 plan=$2 answer backup='' dump was_active=0 stopped=0
+  local parser="${BASH_SOURCE[0]%/*}/npctl_stream_config.py" module_plan needs_stream=0
   local policy=/usr/sbin/policy-rc.d had_policy=0 installed_policy=0 attempted=0 restored=0
   shift 2
   nginx_migration_plan_allowed <<<"$plan" || { warn '迁移计划包含不支持的软件包删除。'; return 1; }
   require_command systemctl '迁移需要 systemd 管理 Nginx。' || return 1
   require_command invoke-rc.d '迁移需要 invoke-rc.d 阻止软件包提前启动服务。' || return 1
+  require_command python3 '请先使用 setup 选项 9 补齐迁移依赖。' || return 1
+  [[ -f $parser ]] || { warn '缺少模块迁移解析器，请使用 setup 选项 9 更新完整 npctl。'; return 1; }
   [[ -d /etc/nginx && ! -L /etc/nginx ]] || { warn '迁移仅支持普通 /etc/nginx 目录。'; return 1; }
   nginx -t || return 1
   dump=$(nginx -T) || return 1
-  if grep -Eq '(^|[;{}])[[:space:]]*load_module([[:space:]]|$)' <<<"$dump"; then
-    warn '已加载动态模块，不能直接切换到官方内核；请先处理模块 ABI 兼容性。'
-    return 1
-  fi
+  module_plan=$(python3 "$parser" stream-module-plan <(printf '%s\n' "$dump") /etc/nginx) || return 1
+  if [[ $module_plan != '[]' ]] || grep -Eq '^Remv libnginx-mod-stream( |:)' <<<"$plan"; then needs_stream=1; fi
   printf '%s\n' "$plan"
-  warn '将替换发行版 nginx，仅移除 nginx-common（不 purge），完整备份并恢复 /etc/nginx。'
+  warn '将替换发行版 nginx，仅允许移除 nginx-common / libnginx-mod-stream（不 purge）。'
+  warn '完整备份并恢复原配置；旧 Stream 加载指令将替换为官方内置模块，网站及 SNI 映射保留。'
   warn '迁移会短暂停止 Nginx；若安装失败，软件包版本不会自动回滚。'
   read -r -p '确认迁移到官方 Nginx？[y/N]: ' answer || return 1
   case "$answer" in y|Y|yes|YES) ;; *) echo '已取消迁移，未修改软件包。'; return 1 ;; esac
@@ -119,6 +131,11 @@ nginx_migrate_common_package() (
     fi
     mkdir -p /etc/nginx || return 1
     cp -a "$backup/nginx/." /etc/nginx/ || return 1
+    # Also works after a partial package failure: adapt loaders only when the
+    # binary actually on disk has built-in Stream. Otherwise retain originals.
+    if [[ $module_plan != '[]' ]] && nginx_has_builtin_stream; then
+      python3 "$parser" stream-module-apply "$backup/stream-module-plan.json" /etc/nginx || return 1
+    fi
     restored=1
   }
   cleanup_migration() {
@@ -147,7 +164,11 @@ nginx_migrate_common_package() (
   cp -a /etc/nginx "$backup/nginx" || return 1
   printf '%s\n' "$dump" >"$backup/nginx-T.txt"
   printf '%s\n' "$plan" >"$backup/apt-plan.txt"
+  printf '%s\n' "$module_plan" >"$backup/stream-module-plan.json" || return 1
   dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' nginx nginx-common >"$backup/packages.txt" || return 1
+  if [[ $needs_stream == 1 ]]; then
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' libnginx-mod-stream >>"$backup/packages.txt" || true
+  fi
   echo "迁移备份: $backup"
 
   # Enforce the removal allowlist inside APT's transaction, not just in a
@@ -159,7 +180,9 @@ awk '
   !actions && $0 == "" { actions=1; next }
   actions && $5 == "**REMOVE**" {
     name=$1; sub(/:.*/, "", name)
-    if (name != "nginx-common") { print "Unexpected package removal: " $1 > "/dev/stderr"; exit 1 }
+    if (name != "nginx-common" && name != "libnginx-mod-stream") {
+      print "Unexpected package removal: " $1 > "/dev/stderr"; exit 1
+    }
   }
   END { if (!actions) exit 1 }
 '
@@ -194,12 +217,16 @@ EOF
     -o "DPkg::Tools::Options::$backup/guard-removals::Version=2" \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     install -y "$@" "nginx=$candidate" || return 1
+  if [[ $needs_stream == 1 ]] && ! nginx_has_builtin_stream; then
+    warn '安装后的 Nginx 未检测到内置 Stream / ssl_preread，停止迁移并保留备份。'
+    return 1
+  fi
   restore_migration_config || return 1
   systemctl daemon-reload || return 1
   nginx -t || return 1
   if [[ $was_active == 1 ]]; then systemctl start nginx || return 1; fi
   stopped=0
-  echo "已完成官方 Nginx 迁移，原配置完整保留；备份: $backup"
+  echo "已完成官方 Nginx 迁移，网站及 SNI 配置保留；备份: $backup"
 )
 
 nginx_install_official_package() {
@@ -221,13 +248,14 @@ nginx_install_official_package() {
   fi
   echo "Nginx 官方 stable 候选版本: $candidate"
   if ! apt-get -s --no-remove install "$@" "nginx=$candidate"; then
-    echo '检测到软件包冲突，检查是否仅需受控替换 nginx-common。'
+    echo '检测到软件包冲突，检查是否仅需受控替换 nginx-common / libnginx-mod-stream。'
     plan=$(LC_ALL=C apt-get -s -o APT::Get::Purge=false install "$@" "nginx=$candidate") || return 1
     if nginx_migration_plan_allowed <<<"$plan"; then
       nginx_migrate_common_package "$candidate" "$plan" "$@"
       return $?
     fi
-    warn '无法无损安装官方包。发行版 nginx-common / nginx-core 或 libnginx-mod-* 可能冲突。'
+    printf '%s\n' "$plan"
+    warn 'APT 计划不满足自动迁移白名单（仅 nginx-common / libnginx-mod-stream），已展示完整计划。'
     warn '未删除任何软件包；请先备份 /etc/nginx，手动处理旧包和动态模块兼容性后重试，勿直接 purge 配置。'
     return 1
   fi

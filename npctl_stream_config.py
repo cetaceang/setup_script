@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small Nginx lexer for conservative listener migration; preserves other text."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -228,6 +229,83 @@ def probe(dump_path, allowed_paths, managed_stream):
                     raise ValueError(f'不明配置占用本地 HTTPS 8443，停止操作: {name}')
 
 
+def stream_module_plan(dump_path, config_root):
+    """Plan only Stream loader edits; never modify a loaded module's target."""
+    root = Path(config_root).resolve()
+    sections = {}
+    current = None
+    for line in Path(dump_path).read_bytes().decode().splitlines(keepends=True):
+        match = re.match(r'^# configuration file (.+):\s*$', line)
+        if match:
+            current = match[1]
+            sections[current] = ''
+        elif current:
+            sections[current] += line
+    if not sections:
+        raise ValueError('无法解析 nginx -T 的实际模块加载路径')
+    plan = []
+    for name, body in sections.items():
+        selected = []
+        for parts, delimiter, _, end in directives(body):
+            if parts[0][0].strip('\"\'') != 'load_module':
+                continue
+            if (delimiter != ';' or len(parts) != 2 or parts[1][0].strip('\"\'') not in
+                    ('modules/ngx_stream_module.so', '/usr/lib/nginx/modules/ngx_stream_module.so')):
+                raise ValueError(f'其他或非标准动态模块不自动迁移，请先处理模块 ABI 兼容性: {name}')
+            selected.append((parts[0][1], end))
+        if not selected:
+            continue
+        path = Path(os.path.abspath(name))
+        relative = path.relative_to(root)
+        if not path.parent.resolve().is_relative_to(root):
+            raise ValueError(f'模块加载配置的父目录不能指向 /etc/nginx 之外: {name}')
+        original = path.read_bytes().decode()
+        if original.rstrip('\n') != body.rstrip('\n'):
+            raise ValueError(f'模块配置在 nginx -T 后发生变化，请重试: {name}')
+        # nginx -T appends a separator newline; edit the original file's bytes.
+        content = original
+        for parts, delimiter, _, end in reversed(list(directives(original))):
+            if delimiter == ';' and parts[0][0].strip('\"\'') == 'load_module':
+                content = content[:parts[0][1]] + content[end:]
+        if not content.strip():
+            content = '# Stream / ssl_preread is built into nginx.org packages.\n'
+        plan.append({'path': str(relative), 'content': content,
+                     'sha256': hashlib.sha256(original.encode()).hexdigest(),
+                     'link': os.readlink(path) if path.is_symlink() else None})
+    return plan
+
+
+def apply_stream_module_plan(plan_path, config_root):
+    root = Path(config_root).resolve()
+    plan = json.loads(Path(plan_path).read_text())
+    if not isinstance(plan, list):
+        raise ValueError('模块迁移计划格式不兼容')
+    pending = []
+    for item in plan:
+        relative = Path(item['path'])
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('模块迁移计划不能引用配置目录之外的路径')
+        path = root / relative
+        if not path.parent.resolve().is_relative_to(root):
+            raise ValueError(f'模块配置父目录发生变化: {path}')
+        if item['link'] is not None:
+            if not path.is_symlink() or os.readlink(path) != item['link']:
+                raise ValueError(f'模块加载链接发生变化: {path}')
+        elif path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+            raise ValueError(f'模块加载配置发生变化: {path}')
+        pending.append((path, item))
+    for path, item in pending:
+        if item['link'] is not None:
+            # The distro package removed the external symlink target. Keep a
+            # regular config at the same path, including for explicit includes.
+            path.unlink()
+            path.write_bytes(item['content'].encode())
+            path.chmod(0o644)
+        else:
+            path.write_bytes(item['content'].encode())
+        print(f'Stream 已改用官方内置模块，移除旧加载指令: {path}')
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -242,12 +320,22 @@ def main():
     listener = sub.add_parser('has-listener')
     listener.add_argument('dump')
     listener.add_argument('port', type=int)
+    module_plan = sub.add_parser('stream-module-plan')
+    module_plan.add_argument('dump')
+    module_plan.add_argument('root')
+    module_apply = sub.add_parser('stream-module-apply')
+    module_apply.add_argument('plan')
+    module_apply.add_argument('root')
     args = parser.parse_args()
     try:
         if args.command == 'migrate':
             migrate(args.paths, args.metadata, args.direction == 'enable')
         elif args.command == 'has-listener':
             print('yes' if has_listener(args.dump, args.port) else 'no')
+        elif args.command == 'stream-module-plan':
+            print(json.dumps(stream_module_plan(args.dump, args.root)))
+        elif args.command == 'stream-module-apply':
+            apply_stream_module_plan(args.plan, args.root)
         else:
             probe(args.dump, args.paths, args.managed_stream)
     except (ValueError, OSError, KeyError, TypeError) as error:

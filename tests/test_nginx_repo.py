@@ -21,7 +21,8 @@ class NginxRepoTests(unittest.TestCase):
         self.apt = self.root / 'apt'
         self.keyrings = self.root / 'keyrings'
         for directory in (self.bin, self.scripts, self.nginx / 'sites-available',
-                          self.nginx / 'sites-enabled', self.nginx / 'conf.d', self.root / 'usr/sbin'):
+                          self.nginx / 'sites-enabled', self.nginx / 'conf.d', self.nginx / 'modules-enabled',
+                          self.root / 'usr/sbin'):
             directory.mkdir(parents=True)
         self.os_release = self.root / 'os-release'
         self.os_release.write_text('ID=ubuntu\nVERSION_CODENAME=noble\n')
@@ -32,7 +33,8 @@ class NginxRepoTests(unittest.TestCase):
                         '/var/backups/npctl': str(self.root / 'backups'),
                         '/run/npctl-nginx-migration.lock': str(self.root / 'migration.lock'),
                         '/usr/sbin': str(self.root / 'usr/sbin')}
-        for name in ('setup.sh', 'nginx_proxy_control.sh', 'npctl_nginx_repo.sh', 'npctl_stream.sh'):
+        for name in ('setup.sh', 'nginx_proxy_control.sh', 'npctl_nginx_repo.sh', 'npctl_stream.sh',
+                     'npctl_stream_config.py'):
             source = (REPO / name).read_text()
             for old, new in replacements.items():
                 source = source.replace(old, new)
@@ -61,7 +63,7 @@ if [[ $1 == -s ]]; then
   fi
   if [[ -f $FIXTURE/conflicting_packages ]]; then
     [[ $* != *--no-remove* ]] || exit 100
-    echo 'Remv libnginx-mod-stream [1.28.0]'; exit
+    echo 'Remv libnginx-mod-http-lua [1.28.0]'; exit
   fi
   exit 0
 fi
@@ -71,12 +73,19 @@ if [[ $* == *DPkg::Pre-Install-Pkgs* ]]; then
     if [[ $arg == DPkg::Pre-Install-Pkgs::* ]]; then hook=${arg#*=}; fi
   done
   protocol='VERSION 2\nAPT::Get::Assume-Yes=true\n\nnginx-common 1.28.0 > - **REMOVE**\n'
+  if grep -q '^Remv libnginx-mod-stream ' "$FIXTURE/migration_plan" 2>/dev/null; then
+    protocol+='libnginx-mod-stream 1.28.0 > - **REMOVE**\n'
+  fi
   if [[ -f $FIXTURE/unexpected_removal ]]; then protocol+='unrelated 1.0 > - **REMOVE**\n'; fi
   printf '%b' "$protocol" | "$hook" || exit 100
   "$FIXTURE/usr/sbin/policy-rc.d" nginx start
   [[ $? == 101 ]] || exit 1
   echo 'package default' > "$FIXTURE/nginx/nginx.conf"
   echo 'package default' > "$FIXTURE/nginx/conf.d/default.conf"
+  if [[ -f $FIXTURE/stream-target && ! -f $FIXTURE/old_binary_on_failure && ! -f $FIXTURE/keep_stream_target ]]; then
+    target=$(cat "$FIXTURE/stream-target")
+    if [[ -e $target ]]; then rm "$target"; fi
+  fi
 fi
 printf '%s\\n' "$*" >> "$FIXTURE/installed"
 [[ ! -f $FIXTURE/fail_package_install ]]
@@ -112,7 +121,27 @@ fi
 ''')
         self.stub('nginx', '''#!/bin/bash
 echo "nginx $*" >> "$FIXTURE/commands"
-if [[ $1 == -T ]]; then cat "$FIXTURE/nginx/nginx.conf"; fi
+if [[ $1 == -V ]]; then
+  if [[ -f $FIXTURE/installed && ! -f $FIXTURE/no_builtin_stream && ! -f $FIXTURE/old_binary_on_failure ]]; then
+    echo 'configure arguments: --with-stream --with-stream_ssl_preread_module' >&2
+  else
+    echo 'configure arguments: --with-stream=dynamic --with-stream_ssl_preread_module' >&2
+  fi
+  exit 0
+fi
+if [[ $1 == -T ]]; then
+  for path in "$FIXTURE/nginx/nginx.conf" "$FIXTURE/nginx"/modules-enabled/*; do
+    [[ -f $path ]] || continue
+    printf '# configuration file %s:\\n' "$path"
+    cat "$path"
+    printf '\\n'
+  done
+fi
+if [[ $1 == -t ]]; then
+  for path in "$FIXTURE/nginx"/modules-enabled/*; do
+    if [[ -L $path && ! -e $path ]]; then exit 1; fi
+  done
+fi
 [[ ! -f $FIXTURE/fail_nginx ]]
 ''')
         self.stub('systemctl', '''#!/bin/bash
@@ -308,7 +337,7 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
 
     def test_migration_rejects_additional_removals_or_purge(self):
         self.prepare_migration()
-        for removal in ('Remv libnginx-mod-stream [1.28.0]', 'Remv nginx-core [1.28.0]',
+        for removal in ('Remv libnginx-mod-stream-geoip2 [1.28.0]', 'Remv nginx-core [1.28.0]',
                         'Remv unrelated [1.0]', 'Purg nginx-common [1.28.0]'):
             with self.subTest(removal=removal):
                 (self.root / 'migration_plan').write_text('Remv nginx-common [1.28.0]\n' + removal + '\n')
@@ -322,6 +351,96 @@ if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
         result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
         self.assertIn('动态模块', result.stderr)
         self.assert_not_installed()
+
+    def prepare_stream_migration(self):
+        policy = self.prepare_migration()
+        with (self.root / 'migration_plan').open('a') as plan:
+            plan.write('Remv libnginx-mod-stream [1.28.0]\n')
+        target = self.root / 'mod-stream.conf'
+        target.write_text('load_module modules/ngx_stream_module.so;\n')
+        loader = self.nginx / 'modules-enabled/50-mod-stream.conf'
+        loader.symlink_to(target)
+        (self.root / 'stream-target').write_text(str(target))
+        return policy, loader, target
+
+    def test_stream_module_migration_replaces_dangling_loader_and_keeps_sni(self):
+        policy, loader, target = self.prepare_stream_migration()
+        before = self.config.read_bytes()
+        policy_before = policy.read_bytes()
+        sni = self.nginx / 'npctl-stream'
+        sni.mkdir()
+        (sni / 'stream.conf').write_text('stream { map $ssl_preread_server_name $target { default 127.0.0.1:8443; } }\n')
+        (sni / 'nodes.tsv').write_text('example.com\t34138\n')
+        self.run_bash('nginx_install_official_package --only-upgrade', input='y\n')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(target.exists())
+        self.assertFalse(loader.is_symlink())
+        self.assertTrue(loader.is_file())
+        self.assertNotIn('load_module', loader.read_text())
+        self.assertEqual((sni / 'nodes.tsv').read_text(), 'example.com\t34138\n')
+        self.assertEqual(policy.read_bytes(), policy_before)
+        backup, = (self.root / 'backups').iterdir()
+        self.assertEqual((backup / 'nginx/modules-enabled/50-mod-stream.conf').readlink(), target)
+        self.assertTrue((backup / 'stream-module-plan.json').is_file())
+
+    def test_stream_loader_in_main_config_is_removed_without_touching_other_text(self):
+        self.prepare_migration()
+        directive = 'load_module "/usr/lib/nginx/modules/ngx_stream_module.so";'
+        original = directive + ' # retained comment\r\nevents {}\r\nhttp {}\r\n'
+        self.config.write_bytes(original.encode())
+        self.run_bash('nginx_install_official_package', input='y\n')
+        self.assertEqual(self.config.read_bytes(), original.replace(directive, '').encode())
+
+    def test_stream_link_conversion_does_not_modify_external_loader_target(self):
+        _, loader, target = self.prepare_stream_migration()
+        original = target.read_bytes()
+        (self.root / 'keep_stream_target').touch()
+        self.run_bash('nginx_install_official_package', input='y\n')
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(loader.is_symlink())
+        self.assertNotIn('load_module', loader.read_text())
+
+    def test_stream_migration_rejects_external_symlinked_parent_directory(self):
+        self.prepare_stream_migration()
+        directory = self.nginx / 'modules-enabled'
+        external = self.root / 'external-modules'
+        directory.rename(external)
+        directory.symlink_to(external)
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('父目录', result.stderr)
+        self.assert_not_installed()
+
+    def test_installed_but_unloaded_stream_module_can_be_replaced(self):
+        _, loader, _ = self.prepare_stream_migration()
+        loader.unlink()
+        original = self.config.read_bytes()
+        self.run_bash('nginx_install_official_package', input='y\n')
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse(loader.exists())
+
+    def test_commented_load_module_is_not_migrated(self):
+        self.prepare_migration()
+        original = '# example; load_module /custom/module.so;\nevents {}\nhttp {}\n'
+        self.config.write_text(original)
+        self.run_bash('nginx_install_official_package', input='y\n')
+        self.assertEqual(self.config.read_text(), original)
+
+    def test_stream_migration_requires_actual_builtins_in_new_binary(self):
+        _, loader, _ = self.prepare_stream_migration()
+        (self.root / 'no_builtin_stream').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('未检测到内置 Stream', result.stderr)
+        self.assertTrue(loader.is_symlink())
+        self.assertNotIn('systemctl start nginx', self.commands())
+
+    def test_stream_migration_failure_keeps_loader_for_old_dynamic_binary(self):
+        _, loader, target = self.prepare_stream_migration()
+        (self.root / 'old_binary_on_failure').touch()
+        (self.root / 'fail_package_install').touch()
+        self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertTrue(loader.is_symlink())
+        self.assertTrue(target.is_file())
+        self.assertIn('systemctl start nginx', self.commands())
 
     def test_migration_backup_failure_never_stops_service(self):
         policy = self.prepare_migration()
