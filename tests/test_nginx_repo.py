@@ -21,14 +21,17 @@ class NginxRepoTests(unittest.TestCase):
         self.apt = self.root / 'apt'
         self.keyrings = self.root / 'keyrings'
         for directory in (self.bin, self.scripts, self.nginx / 'sites-available',
-                          self.nginx / 'sites-enabled', self.nginx / 'conf.d'):
+                          self.nginx / 'sites-enabled', self.nginx / 'conf.d', self.root / 'usr/sbin'):
             directory.mkdir(parents=True)
         self.os_release = self.root / 'os-release'
         self.os_release.write_text('ID=ubuntu\nVERSION_CODENAME=noble\n')
         self.config = self.nginx / 'nginx.conf'
         self.config.write_text('# user-owned config, including SNI\nevents {}\nhttp {}\n')
         replacements = {'/etc/nginx': str(self.nginx), '/etc/os-release': str(self.os_release),
-                        '/etc/apt': str(self.apt), '/usr/share/keyrings': str(self.keyrings)}
+                        '/etc/apt': str(self.apt), '/usr/share/keyrings': str(self.keyrings),
+                        '/var/backups/npctl': str(self.root / 'backups'),
+                        '/run/npctl-nginx-migration.lock': str(self.root / 'migration.lock'),
+                        '/usr/sbin': str(self.root / 'usr/sbin')}
         for name in ('setup.sh', 'nginx_proxy_control.sh', 'npctl_nginx_repo.sh', 'npctl_stream.sh'):
             source = (REPO / name).read_text()
             for old, new in replacements.items():
@@ -43,6 +46,7 @@ class NginxRepoTests(unittest.TestCase):
 case "$*" in
   *ca-certificates*) printf 'install ok installed' ;;
   *Maintainer*) echo 'NGINX Packaging <nginx-packaging@f5.com>' ;;
+  *nginx-common*) echo 'nginx 1.28.0 installed'; echo 'nginx-common 1.28.0 installed' ;;
   *Version*) echo '1.28.0-1~noble' ;;
   *) exit 1 ;;
 esac
@@ -50,8 +54,32 @@ esac
         self.stub('apt-get', '''#!/bin/bash
 echo "apt-get $*" >> "$FIXTURE/commands"
 if [[ $* == *update* ]]; then [[ ! -f $FIXTURE/fail_index ]]; exit; fi
-if [[ $1 == -s ]]; then [[ ! -f $FIXTURE/conflicting_packages ]]; exit; fi
+if [[ $1 == -s ]]; then
+  if [[ -f $FIXTURE/migration_plan ]]; then
+    [[ $* != *--no-remove* ]] || exit 100
+    cat "$FIXTURE/migration_plan"; exit
+  fi
+  if [[ -f $FIXTURE/conflicting_packages ]]; then
+    [[ $* != *--no-remove* ]] || exit 100
+    echo 'Remv libnginx-mod-stream [1.28.0]'; exit
+  fi
+  exit 0
+fi
+if [[ $* == *--download-only* ]]; then [[ ! -f $FIXTURE/fail_package_download ]]; exit; fi
+if [[ $* == *DPkg::Pre-Install-Pkgs* ]]; then
+  for arg in "$@"; do
+    if [[ $arg == DPkg::Pre-Install-Pkgs::* ]]; then hook=${arg#*=}; fi
+  done
+  protocol='VERSION 2\nAPT::Get::Assume-Yes=true\n\nnginx-common 1.28.0 > - **REMOVE**\n'
+  if [[ -f $FIXTURE/unexpected_removal ]]; then protocol+='unrelated 1.0 > - **REMOVE**\n'; fi
+  printf '%b' "$protocol" | "$hook" || exit 100
+  "$FIXTURE/usr/sbin/policy-rc.d" nginx start
+  [[ $? == 101 ]] || exit 1
+  echo 'package default' > "$FIXTURE/nginx/nginx.conf"
+  echo 'package default' > "$FIXTURE/nginx/conf.d/default.conf"
+fi
 printf '%s\\n' "$*" >> "$FIXTURE/installed"
+[[ ! -f $FIXTURE/fail_package_install ]]
 ''')
         self.stub('apt', '#!/bin/bash\necho "apt $*" >> "$FIXTURE/commands"\n')
         self.stub('curl', '''#!/bin/bash
@@ -84,12 +112,19 @@ fi
 ''')
         self.stub('nginx', '''#!/bin/bash
 echo "nginx $*" >> "$FIXTURE/commands"
+if [[ $1 == -T ]]; then cat "$FIXTURE/nginx/nginx.conf"; fi
 [[ ! -f $FIXTURE/fail_nginx ]]
 ''')
         self.stub('systemctl', '''#!/bin/bash
 echo "systemctl $*" >> "$FIXTURE/commands"
-if [[ $1 == is-active ]]; then [[ -f $FIXTURE/service_active ]]; fi
+if [[ $1 == is-active ]]; then [[ -f $FIXTURE/service_active ]]; exit; fi
+if [[ $1 == stop ]]; then
+  [[ ! -f $FIXTURE/fail_stop ]] || exit 1
+  if [[ -f $FIXTURE/service_active ]]; then rm "$FIXTURE/service_active"; fi
+fi
+if [[ $1 == start ]]; then touch "$FIXTURE/service_active"; fi
 ''')
+        self.stub('invoke-rc.d', '#!/bin/bash\nexit 0\n')
 
     def stub(self, name, source):
         path = self.bin / name
@@ -103,9 +138,9 @@ if [[ $1 == is-active ]]; then [[ -f $FIXTURE/service_active ]]; fi
     def set_versions(self, url):
         (self.root / 'versions').write_text(f' nginx | 1.30.0-1~noble | {url} noble/nginx amd64 Packages\n')
 
-    def run_bash(self, code, *, script='setup.sh', success=True):
+    def run_bash(self, code, *, script='setup.sh', success=True, input=None):
         result = subprocess.run(['bash', '-c', 'source "$1/$2"; ' + code, 'test', str(self.scripts), script],
-                                env=self.env, capture_output=True, text=True)
+                                env=self.env, capture_output=True, text=True, input=input)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -209,6 +244,134 @@ if [[ $1 == is-active ]]; then [[ -f $FIXTURE/service_active ]]; fi
         self.assertIn('勿直接 purge', result.stderr)
         self.assertIn('apt-get -s --no-remove install', self.commands())
         self.assert_not_installed()
+
+    def prepare_migration(self, *, active=True):
+        (self.root / 'migration_plan').write_text(
+            'Remv nginx-common [1.28.0]\nInst nginx [1.28.0] (1.30.0 nginx:stable)\n')
+        if active:
+            (self.root / 'service_active').touch()
+        policy = self.root / 'usr/sbin/policy-rc.d'
+        policy.write_text('#!/bin/bash\nexit 7\n')
+        policy.chmod(0o755)
+        return policy
+
+    def test_common_only_migration_restores_exact_config_and_host_policy(self):
+        policy = self.prepare_migration()
+        before = self.config.read_bytes()
+        site = self.nginx / 'sites-available/example.com'
+        site.write_text('user-owned site\n')
+        link = self.nginx / 'sites-enabled/example.com'
+        link.symlink_to(site)
+        sni = self.nginx / 'npctl-stream'
+        sni.mkdir()
+        (sni / 'nodes.tsv').write_text('example.com\t34138\n')
+        policy_before = policy.read_bytes()
+        self.run_bash('nginx_install_official_package --only-upgrade', input='y\n')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(site.read_text(), 'user-owned site\n')
+        self.assertEqual(link.readlink(), site)
+        self.assertEqual((sni / 'nodes.tsv').read_text(), 'example.com\t34138\n')
+        self.assertFalse((self.nginx / 'conf.d/default.conf').exists())
+        self.assertEqual(policy.read_bytes(), policy_before)
+        self.assertTrue((self.root / 'service_active').exists())
+        self.assertFalse((self.root / 'migration.lock').exists())
+        backup, = (self.root / 'backups').iterdir()
+        self.assertEqual((backup / 'nginx/nginx.conf').read_bytes(), before)
+        self.assertTrue((backup / 'package-nginx/conf.d/default.conf').exists())
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
+        commands = self.commands()
+        self.assertLess(commands.index('--download-only'), commands.index('systemctl stop nginx'))
+        self.assertLess(commands.index('systemctl stop nginx'), commands.index('DPkg::Pre-Install-Pkgs'))
+        self.assertLess(commands.index('DPkg::Pre-Install-Pkgs'), commands.index('systemctl start nginx'))
+        installed = (self.root / 'installed').read_text()
+        self.assertIn('APT::Get::Purge=false', installed)
+        self.assertNotIn('--no-remove', installed)
+
+    def test_migration_preserves_existing_official_default_and_inactive_state(self):
+        policy = self.prepare_migration(active=False)
+        policy.unlink()
+        default = self.nginx / 'conf.d/default.conf'
+        default.write_text('custom original default\n')
+        self.run_bash('nginx_install_official_package', input='yes\n')
+        self.assertEqual(default.read_text(), 'custom original default\n')
+        self.assertFalse(policy.exists())
+        self.assertNotIn('systemctl start nginx', self.commands())
+
+    def test_migration_requires_explicit_confirmation(self):
+        self.prepare_migration()
+        for answer in ('n\n', '\n', ''):
+            with self.subTest(answer=answer):
+                self.run_bash('nginx_install_official_package', input=answer, success=False)
+                self.assert_not_installed()
+                self.assertFalse((self.root / 'backups').exists())
+                self.assertNotIn('systemctl stop nginx', self.commands())
+
+    def test_migration_rejects_additional_removals_or_purge(self):
+        self.prepare_migration()
+        for removal in ('Remv libnginx-mod-stream [1.28.0]', 'Remv nginx-core [1.28.0]',
+                        'Remv unrelated [1.0]', 'Purg nginx-common [1.28.0]'):
+            with self.subTest(removal=removal):
+                (self.root / 'migration_plan').write_text('Remv nginx-common [1.28.0]\n' + removal + '\n')
+                self.run_bash('nginx_install_official_package', input='y\n', success=False)
+                self.assert_not_installed()
+                self.assertFalse((self.root / 'backups').exists())
+
+    def test_migration_rejects_loaded_dynamic_modules(self):
+        self.prepare_migration()
+        self.config.write_text('load_module /custom/module.so;\nevents {}\nhttp {}\n')
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('动态模块', result.stderr)
+        self.assert_not_installed()
+
+    def test_migration_backup_failure_never_stops_service(self):
+        policy = self.prepare_migration()
+        before = policy.read_bytes()
+        self.stub('cp', '#!/bin/bash\nexit 1\n')
+        self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assert_not_installed()
+        self.assertEqual(policy.read_bytes(), before)
+        self.assertNotIn('systemctl stop nginx', self.commands())
+        self.assertFalse((self.root / 'migration.lock').exists())
+
+    def test_migration_download_failure_never_stops_service(self):
+        self.prepare_migration()
+        (self.root / 'fail_package_download').touch()
+        self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assert_not_installed()
+        self.assertNotIn('systemctl stop nginx', self.commands())
+
+    def test_migration_install_failure_restores_config_policy_and_service(self):
+        policy = self.prepare_migration()
+        before = self.config.read_bytes()
+        policy_before = policy.read_bytes()
+        (self.root / 'fail_package_install').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('软件包未自动回滚', result.stderr)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse((self.nginx / 'conf.d/default.conf').exists())
+        self.assertEqual(policy.read_bytes(), policy_before)
+        self.assertIn('systemctl start nginx', self.commands())
+        self.assertFalse((self.root / 'migration.lock').exists())
+
+    def test_migration_guard_blocks_changed_transaction_before_dpkg(self):
+        policy = self.prepare_migration()
+        before = self.config.read_bytes()
+        policy_before = policy.read_bytes()
+        (self.root / 'unexpected_removal').touch()
+        result = self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assertIn('Unexpected package removal: unrelated', result.stderr)
+        self.assert_not_installed()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(policy.read_bytes(), policy_before)
+
+    def test_migration_stop_failure_restores_policy_without_installing(self):
+        policy = self.prepare_migration()
+        before = policy.read_bytes()
+        (self.root / 'fail_stop').touch()
+        self.run_bash('nginx_install_official_package', input='y\n', success=False)
+        self.assert_not_installed()
+        self.assertEqual(policy.read_bytes(), before)
+        self.assertNotIn('systemctl start nginx', self.commands())
 
     def test_update_uses_official_source_and_preserves_configuration(self):
         (self.root / 'service_active').touch()
